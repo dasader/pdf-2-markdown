@@ -230,3 +230,58 @@ def test_convert_image_refs_are_relative_real_docling_core(tmp_path, monkeypatch
     assert (out / "images").is_dir()
     assert any((out / "images").iterdir())
     assert n_images == 1
+
+
+from app import worker
+
+
+def test_process_one_success(conn, tmp_path, monkeypatch):
+    _job(conn, "j1", sha="Y", opts="O", status="queued")
+    # 업로드 파일 존재해야 함
+    (config.UPLOADS_DIR / "Y.pdf").write_bytes(b"%PDF-1.7")
+    called = {}
+    def fake_convert(pdf, out, **kw):
+        called["out"] = str(out); Path(out).mkdir(parents=True, exist_ok=True)
+        return (3, 1)
+    monkeypatch.setattr(worker.convert, "convert", fake_convert)
+    monkeypatch.setattr(worker.convert, "opts_hash", lambda *a: "O")
+
+    assert worker.process_one(conn) is True
+    row = db.get_job(conn, "j1")
+    assert row["status"] == "done"
+    assert row["result_dir"] == called["out"]
+    assert row["n_tables"] == 3
+    assert row["n_images"] == 1
+
+
+def test_process_one_failure_records_error(conn, monkeypatch):
+    _job(conn, "j1", sha="Z", opts="O", status="queued")
+    (config.UPLOADS_DIR / "Z.pdf").write_bytes(b"%PDF-1.7")
+    def boom(*a, **k): raise RuntimeError("docling exploded")
+    monkeypatch.setattr(worker.convert, "convert", boom)
+    monkeypatch.setattr(worker.convert, "opts_hash", lambda *a: "O")
+
+    assert worker.process_one(conn) is True
+    row = db.get_job(conn, "j1")
+    assert row["status"] == "failed"
+    assert "docling exploded" in row["error"]
+
+
+def test_process_one_empty(conn):
+    assert worker.process_one(conn) is False
+
+
+def test_sweep_deletes_expired_and_orphans(conn, monkeypatch):
+    # 오래된 잡 + 그 파일
+    (config.UPLOADS_DIR / "OLD.pdf").write_bytes(b"%PDF")
+    old_res = config.RESULTS_DIR / "OLD-O"; old_res.mkdir()
+    (old_res / "doc.md").write_text("x")
+    _job(conn, "old", sha="OLD", opts="O", status="done", result_dir=str(old_res))
+    # created_at을 과거로
+    conn.execute("UPDATE jobs SET created_at=? WHERE id='old'",
+                 (db.now() - config.RETENTION_SEC - 10,)); conn.commit()
+
+    worker.sweep(conn)
+    assert db.get_job(conn, "old") is None
+    assert not (config.UPLOADS_DIR / "OLD.pdf").exists()
+    assert not old_res.exists()
