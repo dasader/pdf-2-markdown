@@ -479,3 +479,21 @@ def test_upload_rejects_over_queue_cap(client, monkeypatch):
     job2 = r2.json()[0]
     assert job2["status"] == "failed"
     assert "대기 잡이 너무 많습니다" in job2["error"]
+
+
+def test_web_self_initializes_storage_without_worker(tmp_path, monkeypatch):
+    # worker가 아직 ensure_dirs()/init_db()를 실행하지 않은 상황을 재현: 이 테스트는
+    # (client 픽스처와 달리) db.init_db()를 직접 호출하지 않는다. web이 자기 스토리지를
+    # 스스로 초기화하지 못하면 DB 파일이 없어 /api/jobs가 500을 낸다.
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "app.db")
+    monkeypatch.setattr(config, "UPLOADS_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(config, "RESULTS_DIR", tmp_path / "results")
+    assert not (tmp_path / "app.db").exists()
+
+    from app import web
+    with TestClient(web.app) as c:  # lifespan 실행 -> ensure_dirs()+init_db()
+        assert config.DB_PATH.exists()
+        r = c.get("/api/jobs")
+        assert r.status_code == 200
+        assert r.json() == {"jobs": [], "busy": False}

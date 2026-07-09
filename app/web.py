@@ -5,6 +5,7 @@ import uuid
 import json
 import zipfile
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -19,7 +20,17 @@ from app import config, db, convert
 
 STATIC = Path(__file__).parent.parent / "static"
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # web과 worker는 도커 컴포즈에서 별도 컨테이너로 떠서 시작 순서가 보장되지 않는다.
+    # worker가 아직 안 떴어도 web이 바로 200을 내야 하므로, 스토리지(데이터 디렉터리 +
+    # SQLite 스키마) 초기화를 worker에 의존하지 않고 web이 직접 수행한다.
+    config.ensure_dirs()
+    db.init_db()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
