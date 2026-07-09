@@ -121,10 +121,11 @@ def test_opts_hash_stable_and_distinct():
 
 
 def test_convert_packages_zip(tmp_path, monkeypatch):
-    # docling을 가짜로 대체: doc.md만 쓰고 tables 없음.
+    # docling을 가짜로 대체: doc.md만 쓰고 tables/pictures 없음.
     class FakeDoc:
         tables = []
-        def save_as_markdown(self, path, image_mode=None):
+        pictures = []
+        def save_as_markdown(self, path, artifacts_dir=None, image_mode=None):
             Path(path).write_text("# hi\n")
     class FakeResult:
         document = FakeDoc()
@@ -143,6 +144,29 @@ def test_convert_packages_zip(tmp_path, monkeypatch):
     assert result == (0, 0)
 
 
+def test_convert_counts_n_images_regardless_of_include_images(tmp_path, monkeypatch):
+    # n_images는 include_images=False여도 문서의 실제 그림 개수를 반영해야 함(n_tables와 대칭).
+    class FakeDoc:
+        tables = []
+        pictures = [object(), object()]
+        def save_as_markdown(self, path, artifacts_dir=None, image_mode=None):
+            Path(path).write_text("# hi\n")
+    class FakeResult:
+        document = FakeDoc()
+    class FakeConverter:
+        def __init__(self, *a, **k): pass
+        def convert(self, p): return FakeResult()
+
+    monkeypatch.setattr(convert, "_build_converter", lambda: FakeConverter())
+    out = tmp_path / "Z-O"
+    n_tables, n_images = convert.convert(
+        FIX, out, include_images=False, include_tables_csv=False)
+    assert n_images == 2
+    assert n_tables == 0
+    # include_images=False -> no images/ dir written
+    assert not (out / "images").exists()
+
+
 def test_convert_writes_table_csv_and_counts_n_tables(tmp_path, monkeypatch):
     import pandas as pd
 
@@ -152,7 +176,8 @@ def test_convert_writes_table_csv_and_counts_n_tables(tmp_path, monkeypatch):
 
     class FakeDoc:
         tables = [FakeTable()]
-        def save_as_markdown(self, path, image_mode=None):
+        pictures = []
+        def save_as_markdown(self, path, artifacts_dir=None, image_mode=None):
             Path(path).write_text("# hi\n")
     class FakeResult:
         document = FakeDoc()
@@ -170,3 +195,38 @@ def test_convert_writes_table_csv_and_counts_n_tables(tmp_path, monkeypatch):
     import zipfile
     names = zipfile.ZipFile(out / "result.zip").namelist()
     assert "tables/table-01.csv" in names
+
+
+def test_convert_image_refs_are_relative_real_docling_core(tmp_path, monkeypatch):
+    # 회귀 테스트: 실제 docling_core DoclingDocument로 이미지 1개를 만들어
+    # save_as_markdown(REFERENCED)의 참조 경로가 절대경로가 아니라
+    # "images/..." 상대경로인지 확인한다 (Finding 1의 재발 방지).
+    docling_core = pytest.importorskip("docling_core")
+    PIL = pytest.importorskip("PIL")
+    from PIL import Image
+    from docling_core.types.doc import DoclingDocument
+
+    real_doc = DoclingDocument(name="test")
+    img = Image.new("RGB", (4, 4), color="red")
+    from docling_core.types.doc.document import ImageRef
+    real_doc.add_picture(image=ImageRef.from_pil(img, dpi=72))
+
+    class FakeResult:
+        document = real_doc
+    class FakeConverter:
+        def __init__(self, *a, **k): pass
+        def convert(self, p): return FakeResult()
+
+    monkeypatch.setattr(convert, "_build_converter", lambda: FakeConverter())
+    out = tmp_path / "W-O"
+    n_tables, n_images = convert.convert(
+        FIX, out, include_images=True, include_tables_csv=False)
+
+    md = (out / "doc.md").read_text(encoding="utf-8")
+    assert "images/" in md
+    assert "/tmp" not in md
+    assert str(out) not in md  # no absolute path leaked into the markdown
+    assert not md.count("](/")  # no reference starts with a leading slash
+    assert (out / "images").is_dir()
+    assert any((out / "images").iterdir())
+    assert n_images == 1

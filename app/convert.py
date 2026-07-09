@@ -1,5 +1,4 @@
 import hashlib
-import shutil
 import zipfile
 from pathlib import Path
 
@@ -64,19 +63,9 @@ def convert(pdf_path, out_dir, *, include_images: bool, include_tables_csv: bool
         image_mode = ImageRefMode.REFERENCED if include_images else ImageRefMode.PLACEHOLDER
     except ImportError:
         image_mode = "referenced" if include_images else "placeholder"
-    doc.save_as_markdown(str(md_path), image_mode=image_mode)
-
-    # save_as_markdown(REFERENCED)는 doc_artifacts/ 폴더에 이미지를 쓴다 → images/로 정규화
-    artifacts = out_dir / f"{md_path.stem}_artifacts"
-    images_dir = out_dir / "images"
-    if include_images and artifacts.exists():
-        if images_dir.exists():
-            shutil.rmtree(images_dir)
-        artifacts.rename(images_dir)
-        # md 안의 참조 경로 치환
-        md = md_path.read_text(encoding="utf-8").replace(
-            f"{md_path.stem}_artifacts/", "images/")
-        md_path.write_text(md, encoding="utf-8")
+    # artifacts_dir="images"로 직접 지정 → doc.md에 상대경로(images/...)가 그대로 기록됨
+    # (폴더 rename + 텍스트 치환은 절대경로가 남는 버그가 있어 제거).
+    doc.save_as_markdown(str(md_path), artifacts_dir=Path("images"), image_mode=image_mode)
 
     n_tables = len(getattr(doc, "tables", None) or [])
     tables_dir = out_dir / "tables"
@@ -86,10 +75,8 @@ def convert(pdf_path, out_dir, *, include_images: bool, include_tables_csv: bool
             df = table.export_to_dataframe(doc=doc)
             df.to_csv(tables_dir / f"table-{i:02d}.csv", index=False)
 
-    # n_images: images/ 에 실제로 쓰인 파일 수(정확). include_images=False면 저장된 파일이
-    # 없으므로 0 — 그림 개수 자체를 세려면 doc.pictures가 필요하지만 비용 대비 실익이
-    # 낮아 여기서는 "실제 산출물 개수"를 UI 칩에 보여준다는 원칙을 택함.
-    n_images = sum(1 for f in images_dir.rglob("*") if f.is_file()) if images_dir.exists() else 0
+    # n_images: 문서의 실제 그림 개수(옵션과 무관하게 정확) — n_tables와 대칭.
+    n_images = len(getattr(doc, "pictures", None) or [])
 
     # ZIP 패키징
     zip_path = out_dir / "result.zip"
