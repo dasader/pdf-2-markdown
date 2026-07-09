@@ -33,20 +33,30 @@ def opts_hash(include_images: bool, include_tables_csv: bool) -> str:
 
 def _build_converter(low_mem: bool = False):
     # 지연 import: 테스트가 torch 없이 돌게 함.
+    from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+    from docling.datamodel.settings import settings
     from docling.document_converter import DocumentConverter, PdfFormatOption
+
+    # 저사양 호스트(3GB 워커) 메모리 최적화 — 실측으로 검증한 두 레버:
+    # ① page_batch_size=1: 페이지를 1장씩 처리해 피크 메모리를 대폭 낮춘다.
+    # ② PyPdfiumDocumentBackend: 기본 DoclingParse보다 가벼운 PDF 백엔드(이미지 조밀
+    #    문서의 메모리 주범을 해소). 둘을 합치면 14MB·27p 문서도 3GB 안에서 풀 품질로 변환됨
+    #    (백엔드 교체로 표·텍스트 품질 저하 없음 — 실측 확인).
+    settings.perf.page_batch_size = 1
 
     opts = PdfPipelineOptions()
     opts.do_ocr = False                       # 텍스트 PDF → OCR 모델 미로딩(~2GB 절감)
     opts.do_table_structure = True
     opts.table_structure_options.mode = TableFormerMode.ACCURATE
-    # low_mem: OOM으로 죽은 큰 문서의 재시도. 그림 크롭을 안 들고 있어(가장 큰 메모리
-    # 절감) 텍스트·표만이라도 3GB 안에 통과시킨다. images_scale도 1.25로 낮춰 래스터 축소.
     opts.images_scale = 1.25
+    # low_mem: 위 최적화로도 부족한 극단적 문서의 재시도. 그림 크롭 생성을 꺼(가장 큰
+    # 메모리 절감) 텍스트·표만이라도 통과시킨다.
     opts.generate_picture_images = not low_mem
     return DocumentConverter(
-        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+        format_options={InputFormat.PDF: PdfFormatOption(
+            backend=PyPdfiumDocumentBackend, pipeline_options=opts)}
     )
 
 
