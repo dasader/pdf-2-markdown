@@ -96,3 +96,77 @@ def test_worker_busy(conn):
     assert db.worker_busy(conn) is False
     db.claim_next_queued(conn)
     assert db.worker_busy(conn) is True
+
+
+from pathlib import Path
+from app import convert
+
+FIX = Path(__file__).parent / "fixtures" / "sample.pdf"
+
+
+def test_is_pdf_magic_bytes():
+    assert convert.is_pdf(b"%PDF-1.7 ...")
+    assert not convert.is_pdf(b"PK\x03\x04zip")
+
+
+def test_page_count(_=None):
+    assert convert.page_count(FIX) == 1
+
+
+def test_opts_hash_stable_and_distinct():
+    a = convert.opts_hash(True, True)
+    assert a == convert.opts_hash(True, True)
+    assert a != convert.opts_hash(False, True)
+    assert a != convert.opts_hash(True, False)
+
+
+def test_convert_packages_zip(tmp_path, monkeypatch):
+    # docling을 가짜로 대체: doc.md만 쓰고 tables 없음.
+    class FakeDoc:
+        tables = []
+        def save_as_markdown(self, path, image_mode=None):
+            Path(path).write_text("# hi\n")
+    class FakeResult:
+        document = FakeDoc()
+    class FakeConverter:
+        def __init__(self, *a, **k): pass
+        def convert(self, p): return FakeResult()
+
+    monkeypatch.setattr(convert, "_build_converter", lambda: FakeConverter())
+    out = tmp_path / "X-O"
+    result = convert.convert(FIX, out, include_images=True, include_tables_csv=True)
+    assert (out / "doc.md").exists()
+    assert (out / "result.zip").exists()
+    import zipfile
+    names = zipfile.ZipFile(out / "result.zip").namelist()
+    assert "doc.md" in names
+    assert result == (0, 0)
+
+
+def test_convert_writes_table_csv_and_counts_n_tables(tmp_path, monkeypatch):
+    import pandas as pd
+
+    class FakeTable:
+        def export_to_dataframe(self, doc=None):
+            return pd.DataFrame({"a": [1, 2], "b": [3, 4]})
+
+    class FakeDoc:
+        tables = [FakeTable()]
+        def save_as_markdown(self, path, image_mode=None):
+            Path(path).write_text("# hi\n")
+    class FakeResult:
+        document = FakeDoc()
+    class FakeConverter:
+        def __init__(self, *a, **k): pass
+        def convert(self, p): return FakeResult()
+
+    monkeypatch.setattr(convert, "_build_converter", lambda: FakeConverter())
+    out = tmp_path / "Y-O"
+    n_tables, n_images = convert.convert(
+        FIX, out, include_images=False, include_tables_csv=True)
+    assert n_tables == 1
+    assert n_images == 0
+    assert (out / "tables" / "table-01.csv").exists()
+    import zipfile
+    names = zipfile.ZipFile(out / "result.zip").namelist()
+    assert "tables/table-01.csv" in names
