@@ -137,3 +137,12 @@ def active_before(conn, created_at) -> int:
 def worker_busy(conn) -> bool:
     return conn.execute(
         "SELECT 1 FROM jobs WHERE status='running' LIMIT 1").fetchone() is not None
+
+
+def requeue_running(conn) -> int:
+    # 워커가 running 중에 죽으면 그 잡은 영원히 running으로 남아 worker_busy가
+    # 계속 True가 된다. 워커가 하나뿐이므로 시작 시 남아있는 running은 모두 고아다.
+    cur = conn.execute(
+        "UPDATE jobs SET status='queued', started_at=NULL WHERE status='running'")
+    conn.commit()
+    return cur.rowcount

@@ -51,6 +51,7 @@ def run() -> None:
     config.ensure_dirs()
     db.init_db()
     conn = db.connect()
+    db.requeue_running(conn)  # 이전 실행에서 죽은 running 잡 복구 (워커는 하나뿐)
     last_sweep = 0.0
     while True:
         worked = process_one(conn)

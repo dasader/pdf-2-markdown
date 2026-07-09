@@ -3,6 +3,8 @@ import re
 import time
 import uuid
 import json
+import hmac
+import asyncio
 import zipfile
 import tempfile
 from contextlib import asynccontextmanager
@@ -40,7 +42,7 @@ def _sid(request: Request) -> str:
 
 def _is_admin(request: Request) -> bool:
     key = request.headers.get("X-Admin-Key", "")
-    return bool(config.ADMIN_KEY) and key == config.ADMIN_KEY
+    return bool(config.ADMIN_KEY) and hmac.compare_digest(key, config.ADMIN_KEY)
 
 
 def _row_to_dict(r) -> dict:
@@ -54,6 +56,7 @@ def _row_to_dict(r) -> dict:
     else:
         d["progress"] = 0
     d.pop("session_id", None)
+    d.pop("result_dir", None)  # 서버 절대경로, UI/테스트 모두 미사용
     return d
 
 
@@ -75,8 +78,16 @@ def _safe_name(name: str) -> str:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
-    return (STATIC / "index.html").read_text(encoding="utf-8")
+def index(request: Request):
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    response = HTMLResponse(html)
+    # sid를 SSE 연결 전에 미리 발급해야, 첫 방문자의 GET /events가 나중에 업로드로
+    # 재발급되는 sid와 어긋나서 진행률이 안 보이는 문제가 없다.
+    sid = request.cookies.get("sid")
+    if not sid:
+        sid = uuid.uuid4().hex
+        response.set_cookie("sid", sid, httponly=True, samesite="lax", max_age=30 * 86400)
+    return response
 
 
 @app.post("/api/jobs")
@@ -92,8 +103,16 @@ async def create_jobs(request: Request, response: Response,
     out = []
     try:
         for uf in (files or []):
-            data = await uf.read()
             jid = uuid.uuid4().hex
+            # 가드레일: Starlette가 파트의 Content-Length로 채워주는 uf.size를 먼저
+            # 확인해 초대형 업로드를 메모리에 통째로 읽기 전에 걸러낸다(OOM 방지).
+            # uf.size가 없는(None) 경우에만 아래 read() 이후 len(data) 체크가 백스톱.
+            if uf.size is not None and uf.size > config.MAX_BYTES:
+                db.create_job(conn, id=jid, session_id=sid, filename=uf.filename,
+                              sha256="-", opts_hash=oh, status="failed", page_total=None)
+                db.finish_job(conn, jid, status="failed", error="파일이 100MB를 초과합니다")
+                out.append(db.get_job(conn, jid)); continue
+            data = await uf.read()
             # 가드레일
             if len(data) > config.MAX_BYTES:
                 db.create_job(conn, id=jid, session_id=sid, filename=uf.filename,
@@ -235,11 +254,16 @@ def download_all(request: Request):
 
 
 @app.get("/api/events")
-def events(request: Request):
+async def events(request: Request):
     sid = _sid(request)
     admin = _is_admin(request)
 
-    def gen():
+    async def gen():
+        # 동기 def + time.sleep이면 Starlette가 이 장수(long-lived) 제너레이터를
+        # AnyIO 스레드풀(기본 ~40개)에서 돌려, 열린 탭 수만큼 스레드를 영구 점유해
+        # 업로드/다운로드 같은 다른 동기 엔드포인트를 굶길 수 있다. async+await로
+        # 이벤트 루프에 맡긴다. 내부 sqlite 읽기는 매우 빨라(수 ms 이하) 루프를
+        # 잠깐 블로킹해도 이 내부용 도구 규모에서는 감수 가능한 트레이드오프.
         seen = {}
         for _ in range(600):  # 최대 5분 후 재연결 유도
             conn = db.connect()
@@ -260,6 +284,6 @@ def events(request: Request):
             payload.update(running)
             # busy가 하트비트 역할을 하므로 변경이 없어도 매 틱 전송
             yield f"data: {json.dumps({'jobs': list(payload.values()), 'busy': busy})}\n\n"
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
 
     return StreamingResponse(gen(), media_type="text/event-stream")

@@ -98,6 +98,16 @@ def test_worker_busy(conn):
     assert db.worker_busy(conn) is True
 
 
+def test_requeue_running_resets_orphans(conn):
+    _job(conn, "j1", status="queued")
+    db.claim_next_queued(conn)
+    assert db.get_job(conn, "j1")["status"] == "running"
+    assert db.requeue_running(conn) == 1
+    row = db.get_job(conn, "j1")
+    assert row["status"] == "queued"
+    assert row["started_at"] is None
+
+
 from pathlib import Path
 from app import convert
 
@@ -329,6 +339,19 @@ def client(tmp_path, monkeypatch):
 
 def _pdf_bytes():
     return FIX.read_bytes()
+
+
+def test_index_sets_session_cookie(client):
+    r1 = client.get("/")
+    assert r1.status_code == 200
+    sid1 = r1.cookies.get("sid")
+    assert sid1
+
+    r2 = client.get("/")  # client jar already carries sid1 from r1
+    assert r2.status_code == 200
+    # cookie is reused, not rotated (no new Set-Cookie changing the value)
+    sid2 = r2.cookies.get("sid", sid1)
+    assert sid2 == sid1
 
 
 def test_upload_creates_queued_job(client):
