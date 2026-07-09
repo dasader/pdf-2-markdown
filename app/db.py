@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   result_dir  TEXT,
   n_tables    INTEGER,
   n_images    INTEGER,
+  attempts    INTEGER NOT NULL DEFAULT 0,
   created_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status  ON jobs(status);
@@ -41,6 +42,11 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        # 기존 DB 마이그레이션: attempts 컬럼이 없으면 추가 (SQLite는 IF NOT EXISTS 미지원).
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # 이미 존재
         conn.commit()
     finally:
         conn.close()
@@ -142,7 +148,9 @@ def worker_busy(conn) -> bool:
 def requeue_running(conn) -> int:
     # 워커가 running 중에 죽으면 그 잡은 영원히 running으로 남아 worker_busy가
     # 계속 True가 된다. 워커가 하나뿐이므로 시작 시 남아있는 running은 모두 고아다.
+    # attempts를 올려, 반복해서 워커를 죽이는(OOM 등) 문서가 무한 재시도되지 않게 한다.
     cur = conn.execute(
-        "UPDATE jobs SET status='queued', started_at=NULL WHERE status='running'")
+        "UPDATE jobs SET status='queued', started_at=NULL, attempts=attempts+1 "
+        "WHERE status='running'")
     conn.commit()
     return cur.rowcount

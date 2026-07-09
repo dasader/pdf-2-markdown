@@ -143,7 +143,7 @@ def test_convert_packages_zip(tmp_path, monkeypatch):
         def __init__(self, *a, **k): pass
         def convert(self, p): return FakeResult()
 
-    monkeypatch.setattr(convert, "_build_converter", lambda: FakeConverter())
+    monkeypatch.setattr(convert, "_build_converter", lambda **kw: FakeConverter())
     out = tmp_path / "X-O"
     result = convert.convert(FIX, out, include_images=True, include_tables_csv=True)
     assert (out / "doc.md").exists()
@@ -167,7 +167,7 @@ def test_convert_counts_n_images_regardless_of_include_images(tmp_path, monkeypa
         def __init__(self, *a, **k): pass
         def convert(self, p): return FakeResult()
 
-    monkeypatch.setattr(convert, "_build_converter", lambda: FakeConverter())
+    monkeypatch.setattr(convert, "_build_converter", lambda **kw: FakeConverter())
     out = tmp_path / "Z-O"
     n_tables, n_images = convert.convert(
         FIX, out, include_images=False, include_tables_csv=False)
@@ -195,7 +195,7 @@ def test_convert_writes_table_csv_and_counts_n_tables(tmp_path, monkeypatch):
         def __init__(self, *a, **k): pass
         def convert(self, p): return FakeResult()
 
-    monkeypatch.setattr(convert, "_build_converter", lambda: FakeConverter())
+    monkeypatch.setattr(convert, "_build_converter", lambda **kw: FakeConverter())
     out = tmp_path / "Y-O"
     n_tables, n_images = convert.convert(
         FIX, out, include_images=False, include_tables_csv=True)
@@ -227,7 +227,7 @@ def test_convert_image_refs_are_relative_real_docling_core(tmp_path, monkeypatch
         def __init__(self, *a, **k): pass
         def convert(self, p): return FakeResult()
 
-    monkeypatch.setattr(convert, "_build_converter", lambda: FakeConverter())
+    monkeypatch.setattr(convert, "_build_converter", lambda **kw: FakeConverter())
     out = tmp_path / "W-O"
     n_tables, n_images = convert.convert(
         FIX, out, include_images=True, include_tables_csv=False)
@@ -279,6 +279,49 @@ def test_process_one_failure_records_error(conn, monkeypatch):
 
 def test_process_one_empty(conn):
     assert worker.process_one(conn) is False
+
+
+def test_requeue_running_increments_attempts(conn):
+    _job(conn, "j1", status="queued")
+    db.claim_next_queued(conn)
+    assert db.requeue_running(conn) == 1
+    assert db.get_job(conn, "j1")["attempts"] == 1
+    db.claim_next_queued(conn)
+    db.requeue_running(conn)
+    assert db.get_job(conn, "j1")["attempts"] == 2
+
+
+def test_process_one_retry_uses_low_mem(conn, monkeypatch):
+    # attempts=1인 재시도는 저사양 모드(low_mem=True)로 변환한다.
+    _job(conn, "j1", sha="Y", opts="O", status="queued")
+    conn.execute("UPDATE jobs SET attempts=1 WHERE id='j1'"); conn.commit()
+    (config.UPLOADS_DIR / "Y.pdf").write_bytes(b"%PDF-1.7")
+    seen = {}
+    def fake_convert(pdf, out, **kw):
+        seen.update(kw); Path(out).mkdir(parents=True, exist_ok=True); return (2, 0)
+    monkeypatch.setattr(worker.convert, "convert", fake_convert)
+    monkeypatch.setattr(worker.convert, "opts_hash", lambda *a: "O")
+
+    assert worker.process_one(conn) is True
+    assert seen.get("low_mem") is True
+    assert db.get_job(conn, "j1")["status"] == "done"
+
+
+def test_process_one_fails_after_max_attempts(conn, monkeypatch):
+    # attempts가 상한에 도달하면 변환을 시도하지 않고 실패로 마감(무한 재시도 방지).
+    _job(conn, "j1", sha="Y", opts="O", status="queued")
+    conn.execute("UPDATE jobs SET attempts=2 WHERE id='j1'"); conn.commit()
+    called = {"n": 0}
+    def fake_convert(*a, **k):
+        called["n"] += 1; return (0, 0)
+    monkeypatch.setattr(worker.convert, "convert", fake_convert)
+    monkeypatch.setattr(worker.convert, "opts_hash", lambda *a: "O")
+
+    assert worker.process_one(conn) is True
+    assert called["n"] == 0  # convert 미호출
+    row = db.get_job(conn, "j1")
+    assert row["status"] == "failed"
+    assert "메모리" in row["error"]
 
 
 def test_sweep_deletes_expired_and_orphans(conn, monkeypatch):
