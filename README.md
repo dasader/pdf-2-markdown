@@ -113,4 +113,4 @@ docs/superpowers/  # 설계 문서·구현 계획
 
 ## 라이선스
 
-내부 도구.
+[MIT](LICENSE)
