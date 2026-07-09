@@ -33,6 +33,24 @@ function apiFetch(url, opts = {}) {
   return fetch(url, Object.assign({}, opts, { headers }));
 }
 
+// blob download that carries X-Admin-Key (plain <a>/location.href navigation can't send headers)
+async function download(url, filename) {
+  const res = await apiFetch(url);
+  if (!res.ok) {
+    alert("다운로드에 실패했습니다.");
+    return;
+  }
+  const blob = await res.blob();
+  const objurl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objurl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(objurl), 1000);
+}
+
 function stateText(j) {
   if (j.status === "done") return "완료";
   if (j.status === "running") return (j.progress | 0) + "%";
@@ -71,7 +89,7 @@ function render() {
                 <span class="chip">표 ${j.n_tables || 0} · 이미지 ${j.n_images || 0}</span>
                 <button class="act" data-preview="${j.id}" type="button">미리보기</button>
                 <button class="act ghost" data-copy="${j.id}" type="button">마크다운 복사</button>
-                <a class="act ghost" href="/api/jobs/${j.id}/download">ZIP 내려받기</a>
+                <button class="act ghost" data-download="${j.id}" type="button">ZIP 내려받기</button>
               </div>`
             : ""
         }
@@ -84,6 +102,13 @@ function render() {
   });
   queueEl.querySelectorAll("[data-copy]").forEach((b) => {
     b.onclick = () => copyMd(b.dataset.copy, b);
+  });
+  queueEl.querySelectorAll("[data-download]").forEach((b) => {
+    b.onclick = () => {
+      const j = state.get(b.dataset.download);
+      const stem = (j && j.filename ? j.filename.replace(/\.[^./]+$/, "") : "") || "result";
+      download(`/api/jobs/${b.dataset.download}/download`, `${stem}.zip`);
+    };
   });
 }
 
@@ -252,9 +277,7 @@ addEventListener("keydown", (e) => {
 
 // ---- download all ----
 
-downallEl.onclick = () => {
-  location.href = "/api/download-all";
-};
+downallEl.onclick = () => download("/api/download-all", "pdf2md-변환결과.zip");
 
 // ---- admin toggle ----
 
