@@ -1,0 +1,25 @@
+services:
+  web:
+    build: .
+    image: pdf2md:latest          # web·worker 동일 이미지 1벌만 빌드(저디스크)
+    command: uvicorn app.web:app --host 0.0.0.0 --port 8001
+    ports:
+      - "${PDF2MD_PORT:-8001}:8001"
+    volumes:
+      - ./data:/data
+    environment:
+      PDF2MD_ADMIN_KEY: "${PDF2MD_ADMIN_KEY:-}"
+      PDF2MD_SEC_PER_PAGE: "${PDF2MD_SEC_PER_PAGE:-1.5}"
+    mem_limit: 2g
+    restart: unless-stopped
+
+  worker:
+    build: .
+    image: pdf2md:latest          # web와 같은 이미지 재사용
+    command: python -m app.worker
+    volumes:
+      - ./data:/data
+    environment:
+      PDF2MD_SEC_PER_PAGE: "${PDF2MD_SEC_PER_PAGE:-1.5}"
+    mem_limit: 3g
+    restart: unless-stopped
