@@ -285,3 +285,24 @@ def test_sweep_deletes_expired_and_orphans(conn, monkeypatch):
     assert db.get_job(conn, "old") is None
     assert not (config.UPLOADS_DIR / "OLD.pdf").exists()
     assert not old_res.exists()
+
+
+def test_sweep_preserves_shared_files_of_live_cachehit_job(conn):
+    # 캐시 히트로 result_dir/sha256을 공유하는 최신 job이 있으면,
+    # 만료된 옛 job이 지워져도 참조 카운팅으로 공유 파일은 살아남아야 한다.
+    (config.UPLOADS_DIR / "SHARED.pdf").write_bytes(b"%PDF")
+    shared_res = config.RESULTS_DIR / "SHARED-O"; shared_res.mkdir()
+    (shared_res / "doc.md").write_text("x")
+
+    _job(conn, "old", sha="SHARED", opts="O", status="done", result_dir=str(shared_res))
+    conn.execute("UPDATE jobs SET created_at=? WHERE id='old'",
+                 (db.now() - config.RETENTION_SEC - 10,)); conn.commit()
+
+    # 캐시 히트: 같은 sha256/opts_hash/result_dir, 최근 created_at(기본값)
+    _job(conn, "live", sha="SHARED", opts="O", status="done", result_dir=str(shared_res))
+
+    worker.sweep(conn)
+    assert db.get_job(conn, "old") is None
+    assert db.get_job(conn, "live") is not None
+    assert (config.UPLOADS_DIR / "SHARED.pdf").exists()
+    assert shared_res.exists()
