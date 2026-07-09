@@ -429,3 +429,53 @@ def test_download_all_zips_done_jobs(client):
 
     fresh = TestClient(client.app)  # 결과 없는 새 세션
     assert fresh.get("/api/download-all").status_code == 404
+
+
+def test_download_all_rejects_dotdot_filename(client):
+    # filename=".." must not let a zip entry escape its folder (zip-slip).
+    conn = db.connect()
+    res_dir = config.RESULTS_DIR / "dotdot-O"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    (res_dir / "doc.md").write_text("# hello")
+    db.create_job(conn, id="jdd", session_id="s-dotdot", filename="..", sha256="dd",
+                  opts_hash="O", status="queued", page_total=1)
+    db.finish_job(conn, "jdd", status="done", result_dir=str(res_dir))
+    conn.close()
+
+    client.cookies.set("sid", "s-dotdot")
+    r = client.get("/api/download-all")
+    assert r.status_code == 200
+    zf = zipfile.ZipFile(BytesIO(r.content))
+    for n in zf.namelist():
+        assert not n.startswith("../")
+        assert ".." not in Path(n).parts
+        assert not Path(n).is_absolute()
+
+
+def test_upload_rejects_oversize(client, monkeypatch):
+    monkeypatch.setattr(config, "MAX_BYTES", 3)
+    r = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
+                    data={"include_images": "true", "include_tables_csv": "true"})
+    job = r.json()[0]
+    assert job["status"] == "failed"
+    assert "100MB" in job["error"]
+
+
+def test_upload_rejects_too_many_pages(client, monkeypatch):
+    monkeypatch.setattr(config, "MAX_PAGES", 0)
+    r = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
+                    data={"include_images": "true", "include_tables_csv": "true"})
+    job = r.json()[0]
+    assert job["status"] == "failed"
+    assert "500페이지" in job["error"]
+
+
+def test_upload_rejects_over_queue_cap(client, monkeypatch):
+    monkeypatch.setattr(config, "MAX_QUEUED_PER_SESSION", 1)
+    d = {"include_images": "true", "include_tables_csv": "true"}
+    r1 = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")}, data=d)
+    assert r1.json()[0]["status"] == "queued"
+    r2 = client.post("/api/jobs", files={"files": ("b.pdf", _pdf_bytes(), "application/pdf")}, data=d)
+    job2 = r2.json()[0]
+    assert job2["status"] == "failed"
+    assert "대기 잡이 너무 많습니다" in job2["error"]

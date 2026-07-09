@@ -6,6 +6,7 @@ import json
 import zipfile
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, UploadFile, Form, Request, Response
 from fastapi.responses import (
@@ -57,7 +58,9 @@ def _safe_name(name: str) -> str:
     # ponytail: 경로 구분자만 제거하는 단순 화이트리스트, 유니코드 파일명은 그대로 둠
     name = Path(name).name
     name = re.sub(r'[\\/:*?"<>|]', "_", name).strip()
-    return name or "file"
+    if not name or re.fullmatch(r"\.+", name):
+        name = "file"
+    return name
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -67,7 +70,7 @@ def index():
 
 @app.post("/api/jobs")
 async def create_jobs(request: Request, response: Response,
-                      files: list[UploadFile] = None,
+                      files: Optional[list[UploadFile]] = None,
                       include_images: str = Form("true"),
                       include_tables_csv: str = Form("true")):
     sid = _sid(request)
@@ -197,18 +200,22 @@ def download_all(request: Request):
     used = {}
     fd, tmp_name = tempfile.mkstemp(suffix=".zip")
     os.close(fd)
-    with zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as z:
-        for r in done:
-            src = Path(r["result_dir"])
-            if not src.exists():
-                continue
-            base = _safe_name(Path(r["filename"]).stem)
-            n = used.get(base, 0)
-            used[base] = n + 1
-            folder = base if n == 0 else f"{base}-{n}"
-            for f in sorted(src.rglob("*")):
-                if f.is_file():
-                    z.write(f, f"{folder}/{f.relative_to(src)}")
+    try:
+        with zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as z:
+            for r in done:
+                src = Path(r["result_dir"])
+                if not src.exists():
+                    continue
+                base = _safe_name(Path(r["filename"]).stem)
+                n = used.get(base, 0)
+                used[base] = n + 1
+                folder = base if n == 0 else f"{base}-{n}"
+                for f in sorted(src.rglob("*")):
+                    if f.is_file():
+                        z.write(f, f"{folder}/{f.relative_to(src)}")
+    except Exception:
+        os.unlink(tmp_name)
+        raise
 
     return FileResponse(
         tmp_name, filename="pdf2md-변환결과.zip", media_type="application/zip",
