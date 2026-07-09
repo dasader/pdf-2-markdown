@@ -31,7 +31,7 @@ def opts_hash(include_images: bool, include_tables_csv: bool) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
-def _build_converter():
+def _build_converter(low_mem: bool = False):
     # 지연 import: 테스트가 torch 없이 돌게 함.
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
@@ -41,28 +41,33 @@ def _build_converter():
     opts.do_ocr = False                       # 텍스트 PDF → OCR 모델 미로딩(~2GB 절감)
     opts.do_table_structure = True
     opts.table_structure_options.mode = TableFormerMode.ACCURATE
-    opts.images_scale = 2.0
-    opts.generate_picture_images = True
+    # low_mem: OOM으로 죽은 큰 문서의 재시도. 그림 크롭을 안 들고 있어(가장 큰 메모리
+    # 절감) 텍스트·표만이라도 3GB 안에 통과시킨다. images_scale도 1.25로 낮춰 래스터 축소.
+    opts.images_scale = 1.25
+    opts.generate_picture_images = not low_mem
     return DocumentConverter(
         format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
     )
 
 
-def convert(pdf_path, out_dir, *, include_images: bool, include_tables_csv: bool):
+def convert(pdf_path, out_dir, *, include_images: bool, include_tables_csv: bool,
+            low_mem: bool = False):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     md_path = out_dir / "doc.md"
 
-    result = _build_converter().convert(str(pdf_path))
+    result = _build_converter(low_mem=low_mem).convert(str(pdf_path))
     doc = result.document
 
+    # low_mem에선 그림 크롭을 생성하지 않으므로 이미지 참조도 남기지 않는다(텍스트·표만).
+    emit_images = include_images and not low_mem
     try:
         # docling_core is a light, torch-free dependency of docling itself;
         # optional here so unit tests (fake converter, no docling installed) still run.
         from docling_core.types.doc import ImageRefMode
-        image_mode = ImageRefMode.REFERENCED if include_images else ImageRefMode.PLACEHOLDER
+        image_mode = ImageRefMode.REFERENCED if emit_images else ImageRefMode.PLACEHOLDER
     except ImportError:
-        image_mode = "referenced" if include_images else "placeholder"
+        image_mode = "referenced" if emit_images else "placeholder"
     # artifacts_dir="images"로 직접 지정 → doc.md에 상대경로(images/...)가 그대로 기록됨
     # (폴더 rename + 텍스트 치환은 절대경로가 남는 버그가 있어 제거).
     doc.save_as_markdown(str(md_path), artifacts_dir=Path("images"), image_mode=image_mode)
