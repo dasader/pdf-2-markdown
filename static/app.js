@@ -21,12 +21,6 @@ let pollTimer = null;
 
 // ---- helpers ----
 
-function escapeHtml(s) {
-  const d = document.createElement("div");
-  d.textContent = s ?? "";
-  return d.innerHTML;
-}
-
 function apiFetch(url, opts = {}) {
   const headers = Object.assign({}, opts.headers || {});
   if (adminKey) headers["X-Admin-Key"] = adminKey;
@@ -59,7 +53,67 @@ function stateText(j) {
   return ahead === 0 ? "곧 시작" : `앞에 ${ahead}개 대기`;
 }
 
-// ---- render ----
+// ---- render (keyed reconciliation) ----
+// Reuse existing job elements instead of rebuilding innerHTML each SSE tick.
+// Rebuilding replayed the entrance animation on every tick (flicker), reset the
+// progress-bar transition, and wiped the "복사됨" flash mid-copy. Here each job
+// keeps its DOM node; only changed fields are patched, and done-meta buttons
+// (with their click handlers) are created once and never rebuilt.
+
+const cards = new Map(); // id -> element
+
+function buildCard(j) {
+  const el = document.createElement("div");
+  el.className = "job " + j.status;
+  el.dataset.id = j.id;
+  el.innerHTML =
+    '<span class="node"></span>' +
+    '<div class="job-row"><span class="name"></span><span class="state"></span></div>' +
+    '<div class="bar"><i></i></div>';
+  el.querySelector(".name").textContent = j.filename || "";
+  patchCard(el, j);
+  return el;
+}
+
+function patchCard(el, j) {
+  el.className = "job " + j.status;
+  el.querySelector(".state").textContent = stateText(j);
+  const w = j.status === "running" ? (j.progress | 0) : j.status === "done" ? 100 : 0;
+  el.querySelector(".bar i").style.width = w + "%";
+
+  let err = el.querySelector(".err");
+  if (j.status === "failed" && j.error) {
+    if (!err) {
+      err = document.createElement("div");
+      err.className = "err";
+      el.appendChild(err);
+    }
+    err.textContent = j.error;
+  } else if (err) {
+    err.remove();
+  }
+
+  // done-meta: create once on the transition to done, never rebuild (so an
+  // in-progress "복사됨" flash on the copy button survives later ticks).
+  if (j.status === "done" && !el.querySelector(".done-meta")) {
+    const meta = document.createElement("div");
+    meta.className = "done-meta";
+    meta.innerHTML =
+      '<span class="chip"></span>' +
+      '<button class="act" type="button">미리보기</button>' +
+      '<button class="act ghost" type="button">마크다운 복사</button>' +
+      '<button class="act ghost" type="button">ZIP 내려받기</button>';
+    meta.querySelector(".chip").textContent = `표 ${j.n_tables || 0} · 이미지 ${j.n_images || 0}`;
+    const btns = meta.querySelectorAll("button");
+    btns[0].onclick = () => openPreview(j.id);
+    btns[1].onclick = () => copyMd(j.id, btns[1]);
+    btns[2].onclick = () => {
+      const stem = (j.filename ? j.filename.replace(/\.[^./]+$/, "") : "") || "result";
+      download(`/api/jobs/${j.id}/download`, `${stem}.zip`);
+    };
+    el.appendChild(meta);
+  }
+}
 
 function render() {
   const jobs = [...state.values()].sort((a, b) => b.created_at - a.created_at);
@@ -72,43 +126,26 @@ function render() {
   const myDone = jobs.filter((j) => j.status === "done").length;
   downallEl.classList.toggle("hide", myDone < 2);
 
-  queueEl.innerHTML = jobs
-    .map(
-      (j, k) => `
-      <div class="job ${j.status}" style="animation-delay:${reduce ? 0 : k * 45}ms" data-id="${j.id}">
-        <span class="node"></span>
-        <div class="job-row">
-          <span class="name">${escapeHtml(j.filename)}</span>
-          <span class="state">${stateText(j)}</span>
-        </div>
-        <div class="bar"><i style="width:${j.status === "running" ? (j.progress | 0) : 0}%"></i></div>
-        ${j.status === "failed" && j.error ? `<div class="err">${escapeHtml(j.error)}</div>` : ""}
-        ${
-          j.status === "done"
-            ? `<div class="done-meta">
-                <span class="chip">표 ${j.n_tables || 0} · 이미지 ${j.n_images || 0}</span>
-                <button class="act" data-preview="${j.id}" type="button">미리보기</button>
-                <button class="act ghost" data-copy="${j.id}" type="button">마크다운 복사</button>
-                <button class="act ghost" data-download="${j.id}" type="button">ZIP 내려받기</button>
-              </div>`
-            : ""
-        }
-      </div>`
-    )
-    .join("");
+  const seen = new Set();
+  let created = 0;
+  jobs.forEach((j) => {
+    seen.add(j.id);
+    let el = cards.get(j.id);
+    if (!el) {
+      el = buildCard(j);
+      if (!reduce) el.style.animationDelay = created++ * 45 + "ms";
+      cards.set(j.id, el);
+    } else {
+      patchCard(el, j);
+    }
+    queueEl.appendChild(el); // move into sorted order; a move doesn't restart animations
+  });
 
-  queueEl.querySelectorAll("[data-preview]").forEach((b) => {
-    b.onclick = () => openPreview(b.dataset.preview);
-  });
-  queueEl.querySelectorAll("[data-copy]").forEach((b) => {
-    b.onclick = () => copyMd(b.dataset.copy, b);
-  });
-  queueEl.querySelectorAll("[data-download]").forEach((b) => {
-    b.onclick = () => {
-      const j = state.get(b.dataset.download);
-      const stem = (j && j.filename ? j.filename.replace(/\.[^./]+$/, "") : "") || "result";
-      download(`/api/jobs/${b.dataset.download}/download`, `${stem}.zip`);
-    };
+  cards.forEach((el, id) => {
+    if (!seen.has(id)) {
+      el.remove();
+      cards.delete(id);
+    }
   });
 }
 
