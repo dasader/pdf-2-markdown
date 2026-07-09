@@ -306,3 +306,126 @@ def test_sweep_preserves_shared_files_of_live_cachehit_job(conn):
     assert db.get_job(conn, "live") is not None
     assert (config.UPLOADS_DIR / "SHARED.pdf").exists()
     assert shared_res.exists()
+
+
+# --- Task 4: FastAPI 웹 ---
+
+import zipfile
+from io import BytesIO
+from fastapi.testclient import TestClient
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "app.db")
+    monkeypatch.setattr(config, "UPLOADS_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(config, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(config, "ADMIN_KEY", "secret")
+    config.ensure_dirs(); db.init_db()
+    from app import web
+    return TestClient(web.app)
+
+
+def _pdf_bytes():
+    return FIX.read_bytes()
+
+
+def test_upload_creates_queued_job(client):
+    r = client.post("/api/jobs",
+                    files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
+                    data={"include_images": "true", "include_tables_csv": "true"})
+    assert r.status_code == 200
+    jobs = r.json()
+    assert len(jobs) == 1 and jobs[0]["status"] == "queued"
+    assert "sid" in r.cookies
+
+
+def test_upload_rejects_non_pdf(client):
+    r = client.post("/api/jobs",
+                    files={"files": ("x.pdf", b"PK\x03\x04not a pdf", "application/pdf")},
+                    data={"include_images": "true", "include_tables_csv": "true"})
+    jobs = r.json()
+    assert jobs[0]["status"] == "failed"
+    assert "PDF" in (jobs[0]["error"] or "")
+
+
+def test_cache_hit_second_upload_skips(client):
+    f = {"files": ("a.pdf", _pdf_bytes(), "application/pdf")}
+    d = {"include_images": "true", "include_tables_csv": "true"}
+    r1 = client.post("/api/jobs", files=f, data=d)
+    # 첫 잡을 done으로 만들고 결과 디렉토리 생성
+    conn = db.connect()
+    j1 = r1.json()[0]
+    res_dir = config.RESULTS_DIR / f"{j1['sha256']}-{j1['opts_hash']}"
+    res_dir.mkdir(parents=True); (res_dir / "doc.md").write_text("# x")
+    db.finish_job(conn, j1["id"], status="done", result_dir=str(res_dir),
+                  n_tables=2, n_images=4)
+    conn.close()
+    r2 = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")}, data=d)
+    j2 = r2.json()[0]
+    assert j2["status"] == "done"  # 캐시 히트 → 즉시 done
+    # 캐시 히트 잡은 원본의 표/이미지 카운트를 복사해야 함
+    assert j2["n_tables"] == 2
+    assert j2["n_images"] == 4
+
+
+def test_session_isolation_download_404(client):
+    r1 = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
+                     data={"include_images": "true", "include_tables_csv": "true"})
+    jid = r1.json()[0]["id"]
+    other = TestClient(client.app)  # 새 세션
+    assert other.get(f"/api/jobs/{jid}/download").status_code == 404
+
+
+def test_admin_key_sees_all(client):
+    client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
+                data={"include_images": "true", "include_tables_csv": "true"})
+    other = TestClient(client.app)
+    r = other.get("/api/jobs", headers={"X-Admin-Key": "secret"})
+    assert len(r.json()["jobs"]) >= 1
+
+
+def test_jobs_response_has_busy_and_ahead(client):
+    r1 = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
+                     data={"include_images": "true", "include_tables_csv": "true"})
+    conn = db.connect()
+    claimed = db.claim_next_queued(conn)  # 다른 워커가 이미 하나를 실행 중이라고 가정
+    assert claimed is not None
+    conn.close()
+
+    other = TestClient(client.app)  # 다른 세션
+    r2 = other.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
+                    data={"include_images": "true", "include_tables_csv": "true"})
+    jid2 = r2.json()[0]["id"]
+
+    r = other.get("/api/jobs")
+    body = r.json()
+    assert body["busy"] is True
+    mine = [j for j in body["jobs"] if j["id"] == jid2]
+    assert mine and mine[0]["status"] == "queued"
+    assert mine[0]["ahead"] >= 1
+
+
+def test_download_all_zips_done_jobs(client):
+    r1 = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
+                     data={"include_images": "true", "include_tables_csv": "true"})
+    j1 = r1.json()[0]
+    conn = db.connect()
+    res_dir = config.RESULTS_DIR / f"{j1['sha256']}-{j1['opts_hash']}"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    (res_dir / "doc.md").write_text("# hello")
+    with zipfile.ZipFile(res_dir / "result.zip", "w") as z:
+        z.writestr("doc.md", "# hello")
+    db.finish_job(conn, j1["id"], status="done", result_dir=str(res_dir),
+                  n_tables=0, n_images=0)
+    conn.close()
+
+    r = client.get("/api/download-all")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/zip"
+    zf = zipfile.ZipFile(BytesIO(r.content))
+    assert any(n.endswith("doc.md") for n in zf.namelist())
+
+    fresh = TestClient(client.app)  # 결과 없는 새 세션
+    assert fresh.get("/api/download-all").status_code == 404
