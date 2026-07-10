@@ -259,28 +259,10 @@ async function openPreview(id) {
   }
 }
 
+// ponytail: 접속은 localhost 또는 SSH 터널(=secure context) 전제. http://<서버IP>로
+// 직접 열면 navigator.clipboard가 없어 복사가 실패하고 copyMd가 "복사 실패"를 띄운다.
 async function copyText(text) {
-  if (navigator.clipboard && window.isSecureContext) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return;
-    } catch (e) {
-      /* fall through to legacy path */
-    }
-  }
-  const ta = document.createElement("textarea");
-  ta.value = text;
-  ta.style.position = "fixed";
-  ta.style.opacity = "0";
-  document.body.appendChild(ta);
-  ta.focus();
-  ta.select();
-  try {
-    document.execCommand("copy");
-  } catch (e) {
-    /* ponytail: best-effort clipboard fallback, silent no-op if it fails */
-  }
-  document.body.removeChild(ta);
+  await navigator.clipboard.writeText(text);
 }
 
 async function copyMd(id, btn) {

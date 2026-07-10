@@ -7,7 +7,6 @@ UPLOADS_DIR = DATA_DIR / "uploads"
 RESULTS_DIR = DATA_DIR / "results"
 
 ADMIN_KEY = os.environ.get("PDF2MD_ADMIN_KEY", "")
-PORT = int(os.environ.get("PDF2MD_PORT", "8001"))
 
 MAX_BYTES = 100 * 1024 * 1024
 MAX_PAGES = 500
