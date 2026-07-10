@@ -1,5 +1,6 @@
 import hashlib
 import html
+import re
 import zipfile
 from pathlib import Path
 
@@ -27,7 +28,8 @@ def page_count(path) -> int:
 #   rev 2: docling 기본 백엔드로 복귀(pypdfium 백엔드가 한글 음절을 중복 삽입) +
 #          마크다운 HTML 언이스케이프
 #   rev 3: generate_picture_images 복구 — rev 2 캐시에는 그림이 없다
-CONVERTER_REV = 3
+#   rev 4: 표 CSV를 utf-8-sig로 저장(Excel 한글 깨짐) + 공문서 불릿 기호를 들여쓰기로
+CONVERTER_REV = 4
 
 
 def opts_hash(include_images: bool, include_tables_csv: bool) -> str:
@@ -35,8 +37,30 @@ def opts_hash(include_images: bool, include_tables_csv: bool) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
+# 공문서 불릿 기호 → 목록 깊이. docling은 이 기호를 본문 글자로 남기므로 "- ㅇ 내용"
+# 처럼 불릿이 겹쳐 보인다. 기호를 지우고 그 계층을 들여쓰기로 옮긴다.
+_BULLET_DEPTH = {"□": 0, "ㅁ": 0, "■": 0,
+                 "ㅇ": 1, "○": 1, "◦": 1, "●": 1,
+                 "▪": 2, "-": 2}
+_BULLET_RE = re.compile(rf"^- ([{''.join(_BULLET_DEPTH)}])\s*(.*)$")
+
+
+def _fix_bullets(md: str) -> str:
+    out = []
+    for line in md.split("\n"):
+        m = _BULLET_RE.match(line)          # 표 행은 '|'로 시작해 매칭되지 않는다
+        if m:
+            text = m.group(2).strip()
+            if not text:
+                continue                    # 기호만 있고 내용이 없는 줄 — 본문은 다음 줄에 온다
+            line = "  " * _BULLET_DEPTH[m.group(1)] + "- " + text
+        out.append(line)
+    return "\n".join(out)
+
+
 def _build_converter():
     # 지연 import: 테스트가 torch 없이 돌게 함.
+    from docling.datamodel.backend_options import PdfBackendOptions
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
     from docling.datamodel.settings import settings
@@ -61,8 +85,15 @@ def _build_converter():
     opts.table_structure_options.mode = TableFormerMode.ACCURATE
     opts.images_scale = 1.25
     opts.generate_picture_images = True       # docling 기본값이 False — 끄면 그림이 통째로 누락
+
+    # enforce_same_font=False: 기본값(True)은 폰트가 바뀌는 자리에서 텍스트 셀을 쪼갠다.
+    # 공문서는 낫표·괄호를 본문과 다른 폰트로 찍는 일이 흔해, "｢국가전략기술 선정(안)｣을
+    # 별지와 같이"가 본문과 "｢ ( ) ｣" 두 줄로 갈렸다. 실측: 커버리지 72.0%→78.0%,
+    # 60.7%→61.7%, 표 개수·음절 중복 변화 없음.
+    backend_options = PdfBackendOptions(enforce_same_font=False)
     return DocumentConverter(
-        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+        format_options={InputFormat.PDF: PdfFormatOption(
+            pipeline_options=opts, backend_options=backend_options)}
     )
 
 
@@ -85,7 +116,8 @@ def convert(pdf_path, out_dir, *, include_images: bool, include_tables_csv: bool
     # (폴더 rename + 텍스트 치환은 절대경로가 남는 버그가 있어 제거).
     doc.save_as_markdown(str(md_path), artifacts_dir=Path("images"), image_mode=image_mode)
     # docling이 본문을 HTML 이스케이프한 채 마크다운에 내보낸다("R&amp;D"). 되돌린다.
-    md_path.write_text(html.unescape(md_path.read_text(encoding="utf-8")), encoding="utf-8")
+    md = html.unescape(md_path.read_text(encoding="utf-8"))
+    md_path.write_text(_fix_bullets(md), encoding="utf-8")
 
     n_tables = len(getattr(doc, "tables", None) or [])
     tables_dir = out_dir / "tables"
@@ -93,7 +125,9 @@ def convert(pdf_path, out_dir, *, include_images: bool, include_tables_csv: bool
         tables_dir.mkdir(exist_ok=True)
         for i, table in enumerate(doc.tables, 1):
             df = table.export_to_dataframe(doc=doc)
-            df.to_csv(tables_dir / f"table-{i:02d}.csv", index=False)
+            # utf-8-sig(BOM): Excel은 BOM이 없으면 CSV를 시스템 인코딩(한국어 Windows는
+            # CP949)으로 읽어 한글이 깨진다. BOM 3바이트가 UTF-8임을 알려준다.
+            df.to_csv(tables_dir / f"table-{i:02d}.csv", index=False, encoding="utf-8-sig")
 
     # n_images: 문서의 실제 그림 개수(옵션과 무관하게 정확) — n_tables와 대칭.
     n_images = len(getattr(doc, "pictures", None) or [])
