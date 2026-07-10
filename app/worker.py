@@ -24,10 +24,9 @@ def process_one(conn) -> bool:
     pdf_path = config.UPLOADS_DIR / f"{sha}.pdf"
     out_dir = config.RESULTS_DIR / f"{sha}-{opts}"
     # ponytail: opts 4조합 역산, 조합이 늘면 컬럼 추가
-    include_images = job["opts_hash"] == convert.opts_hash(True, True) or \
-        job["opts_hash"] == convert.opts_hash(True, False)
-    include_csv = job["opts_hash"] == convert.opts_hash(True, True) or \
-        job["opts_hash"] == convert.opts_hash(False, True)
+    include_images, include_csv = next(
+        ((i, c) for i in (True, False) for c in (True, False)
+         if convert.opts_hash(i, c) == opts), (False, False))
     # 1차(attempts 0)는 정상, 재시도(attempts>=1)는 저사양 모드 — OOM으로 죽었던
     # 문서라도 그림 추출을 꺼 텍스트·표만이라도 메모리 안에 통과시킨다.
     low_mem = attempts >= 1
@@ -44,9 +43,7 @@ def process_one(conn) -> bool:
 
 
 def sweep(conn) -> None:
-    ids = db.expired_job_ids(conn, db.now())
-    if ids:
-        db.delete_jobs(conn, ids)
+    db.delete_expired(conn)
     # 고아 파일 정리: 참조되지 않는 upload/result 삭제
     keep_shas = db.referenced_shas(conn)
     for f in config.UPLOADS_DIR.glob("*.pdf"):

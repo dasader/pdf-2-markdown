@@ -2,15 +2,7 @@ import hashlib
 import zipfile
 from pathlib import Path
 
-import fitz  # PyMuPDF
-
-
-def sha256_file(path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+import pypdfium2  # docling이 이미 의존하는 PDF 백엔드
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -22,8 +14,11 @@ def is_pdf(head: bytes) -> bool:
 
 
 def page_count(path) -> int:
-    with fitz.open(path) as doc:
-        return doc.page_count
+    doc = pypdfium2.PdfDocument(path)
+    try:
+        return len(doc)
+    finally:
+        doc.close()
 
 
 def opts_hash(include_images: bool, include_tables_csv: bool) -> str:

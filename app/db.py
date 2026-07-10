@@ -26,10 +26,6 @@ CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id, created_at);
 """
 
 
-def now() -> float:
-    return time.time()
-
-
 def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(config.DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -42,11 +38,6 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
-        # 기존 DB 마이그레이션: attempts 컬럼이 없으면 추가 (SQLite는 IF NOT EXISTS 미지원).
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass  # 이미 존재
         conn.commit()
     finally:
         conn.close()
@@ -57,7 +48,7 @@ def create_job(conn, *, id, session_id, filename, sha256, opts_hash,
     conn.execute(
         "INSERT INTO jobs (id, session_id, filename, sha256, opts_hash, status, "
         "page_total, result_dir, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (id, session_id, filename, sha256, opts_hash, status, page_total, result_dir, now()),
+        (id, session_id, filename, sha256, opts_hash, status, page_total, result_dir, time.time()),
     )
     conn.commit()
 
@@ -89,7 +80,7 @@ def claim_next_queued(conn):
         "UPDATE jobs SET status='running', started_at=? "
         "WHERE id = (SELECT id FROM jobs WHERE status='queued' "
         "            ORDER BY created_at LIMIT 1) RETURNING *",
-        (now(),),
+        (time.time(),),
     )
     row = cur.fetchone()
     conn.commit()
@@ -102,7 +93,7 @@ def finish_job(conn, job_id, *, status, error=None, result_dir=None,
         "UPDATE jobs SET status=?, error=?, result_dir=COALESCE(?, result_dir), "
         "n_tables=COALESCE(?, n_tables), n_images=COALESCE(?, n_images), "
         "finished_at=? WHERE id=?",
-        (status, error, result_dir, n_tables, n_images, now(), job_id),
+        (status, error, result_dir, n_tables, n_images, time.time(), job_id),
     )
     conn.commit()
 
@@ -113,16 +104,11 @@ def count_queued(conn, session_id) -> int:
         (session_id,)).fetchone()[0]
 
 
-def expired_job_ids(conn, now_ts):
-    rows = conn.execute(
-        "SELECT id FROM jobs WHERE created_at < ?",
-        (now_ts - config.RETENTION_SEC,)).fetchall()
-    return [r["id"] for r in rows]
-
-
-def delete_jobs(conn, ids) -> None:
-    conn.executemany("DELETE FROM jobs WHERE id=?", [(i,) for i in ids])
+def delete_expired(conn) -> int:
+    cur = conn.execute("DELETE FROM jobs WHERE created_at < ?",
+                       (time.time() - config.RETENTION_SEC,))
     conn.commit()
+    return cur.rowcount
 
 
 def referenced_shas(conn):

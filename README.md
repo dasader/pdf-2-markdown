@@ -95,7 +95,7 @@ Docling, CPU 전용. 저사양 호스트에 맞춰 튜닝:
 
 ```bash
 uv run --with pytest --with fastapi --with python-multipart --with httpx \
-       --with pymupdf --with pandas python -m pytest tests/test_pdf2md.py -q
+       --with pypdfium2 --with pandas python -m pytest tests/test_pdf2md.py -q
 ```
 
 실제 변환은 Docker 안에서 pip 설치된 docling으로 동작한다.

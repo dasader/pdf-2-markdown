@@ -332,7 +332,7 @@ def test_sweep_deletes_expired_and_orphans(conn, monkeypatch):
     _job(conn, "old", sha="OLD", opts="O", status="done", result_dir=str(old_res))
     # created_at을 과거로
     conn.execute("UPDATE jobs SET created_at=? WHERE id='old'",
-                 (db.now() - config.RETENTION_SEC - 10,)); conn.commit()
+                 (time.time() - config.RETENTION_SEC - 10,)); conn.commit()
 
     worker.sweep(conn)
     assert db.get_job(conn, "old") is None
@@ -349,7 +349,7 @@ def test_sweep_preserves_shared_files_of_live_cachehit_job(conn):
 
     _job(conn, "old", sha="SHARED", opts="O", status="done", result_dir=str(shared_res))
     conn.execute("UPDATE jobs SET created_at=? WHERE id='old'",
-                 (db.now() - config.RETENTION_SEC - 10,)); conn.commit()
+                 (time.time() - config.RETENTION_SEC - 10,)); conn.commit()
 
     # 캐시 히트: 같은 sha256/opts_hash/result_dir, 최근 created_at(기본값)
     _job(conn, "live", sha="SHARED", opts="O", status="done", result_dir=str(shared_res))

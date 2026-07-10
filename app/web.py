@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, Form, Request, Response
+from fastapi import FastAPI, UploadFile, Form, Request
 from fastapi.responses import (
     JSONResponse, PlainTextResponse, FileResponse, StreamingResponse, HTMLResponse,
 )
@@ -45,9 +45,9 @@ def _is_admin(request: Request) -> bool:
     return bool(config.ADMIN_KEY) and hmac.compare_digest(key, config.ADMIN_KEY)
 
 
-def _row_to_dict(r) -> dict:
+def _serialize(conn, r) -> dict:
+    """행 직렬화 + 진행률(추정) + queued 잡의 전역 대기 순번(ahead)."""
     d = dict(r)
-    # 진행률(추정): running이면 경과/예상, 그 외 상태 기반
     if d["status"] == "done":
         d["progress"] = 100
     elif d["status"] == "running" and d.get("started_at"):
@@ -55,16 +55,10 @@ def _row_to_dict(r) -> dict:
         d["progress"] = min(95, int((time.time() - d["started_at"]) / est * 100))
     else:
         d["progress"] = 0
-    d.pop("session_id", None)
-    d.pop("result_dir", None)  # 서버 절대경로, UI/테스트 모두 미사용
-    return d
-
-
-def _serialize(conn, r) -> dict:
-    """행 직렬화 + queued 잡의 전역 대기 순번(ahead)."""
-    d = _row_to_dict(r)
     if d["status"] == "queued":
         d["ahead"] = db.active_before(conn, r["created_at"])
+    d.pop("session_id", None)
+    d.pop("result_dir", None)  # 서버 절대경로, UI/테스트 모두 미사용
     return d
 
 
@@ -90,8 +84,15 @@ def index(request: Request):
     return response
 
 
+def _fail(conn, jid, sid, filename, oh, error, *, sha="-", page_total=None):
+    db.create_job(conn, id=jid, session_id=sid, filename=filename,
+                  sha256=sha, opts_hash=oh, status="failed", page_total=page_total)
+    db.finish_job(conn, jid, status="failed", error=error)
+    return db.get_job(conn, jid)
+
+
 @app.post("/api/jobs")
-async def create_jobs(request: Request, response: Response,
+async def create_jobs(request: Request,
                       files: Optional[list[UploadFile]] = None,
                       include_images: str = Form("true"),
                       include_tables_csv: str = Form("true")):
@@ -108,27 +109,18 @@ async def create_jobs(request: Request, response: Response,
             # 확인해 초대형 업로드를 메모리에 통째로 읽기 전에 걸러낸다(OOM 방지).
             # uf.size가 없는(None) 경우에만 아래 read() 이후 len(data) 체크가 백스톱.
             if uf.size is not None and uf.size > config.MAX_BYTES:
-                db.create_job(conn, id=jid, session_id=sid, filename=uf.filename,
-                              sha256="-", opts_hash=oh, status="failed", page_total=None)
-                db.finish_job(conn, jid, status="failed", error="파일이 100MB를 초과합니다")
-                out.append(db.get_job(conn, jid)); continue
+                out.append(_fail(conn, jid, sid, uf.filename, oh,
+                                 "파일이 100MB를 초과합니다")); continue
             data = await uf.read()
-            # 가드레일
             if len(data) > config.MAX_BYTES:
-                db.create_job(conn, id=jid, session_id=sid, filename=uf.filename,
-                              sha256="-", opts_hash=oh, status="failed", page_total=None)
-                db.finish_job(conn, jid, status="failed", error="파일이 100MB를 초과합니다")
-                out.append(db.get_job(conn, jid)); continue
+                out.append(_fail(conn, jid, sid, uf.filename, oh,
+                                 "파일이 100MB를 초과합니다")); continue
             if not convert.is_pdf(data[:5]):
-                db.create_job(conn, id=jid, session_id=sid, filename=uf.filename,
-                              sha256="-", opts_hash=oh, status="failed", page_total=None)
-                db.finish_job(conn, jid, status="failed", error="PDF 파일이 아닙니다")
-                out.append(db.get_job(conn, jid)); continue
+                out.append(_fail(conn, jid, sid, uf.filename, oh,
+                                 "PDF 파일이 아닙니다")); continue
             if db.count_queued(conn, sid) >= config.MAX_QUEUED_PER_SESSION:
-                db.create_job(conn, id=jid, session_id=sid, filename=uf.filename,
-                              sha256="-", opts_hash=oh, status="failed", page_total=None)
-                db.finish_job(conn, jid, status="failed", error="대기 잡이 너무 많습니다(최대 20)")
-                out.append(db.get_job(conn, jid)); continue
+                out.append(_fail(conn, jid, sid, uf.filename, oh,
+                                 "대기 잡이 너무 많습니다(최대 20)")); continue
 
             sha = convert._sha256_bytes(data)
             pdf_path = config.UPLOADS_DIR / f"{sha}.pdf"
@@ -137,15 +129,11 @@ async def create_jobs(request: Request, response: Response,
             try:
                 pages = convert.page_count(pdf_path)
             except Exception:
-                db.create_job(conn, id=jid, session_id=sid, filename=uf.filename,
-                              sha256=sha, opts_hash=oh, status="failed", page_total=None)
-                db.finish_job(conn, jid, status="failed", error="PDF를 열 수 없습니다")
-                out.append(db.get_job(conn, jid)); continue
+                out.append(_fail(conn, jid, sid, uf.filename, oh,
+                                 "PDF를 열 수 없습니다", sha=sha)); continue
             if pages > config.MAX_PAGES:
-                db.create_job(conn, id=jid, session_id=sid, filename=uf.filename,
-                              sha256=sha, opts_hash=oh, status="failed", page_total=pages)
-                db.finish_job(conn, jid, status="failed", error="500페이지를 초과합니다")
-                out.append(db.get_job(conn, jid)); continue
+                out.append(_fail(conn, jid, sid, uf.filename, oh,
+                                 "500페이지를 초과합니다", sha=sha, page_total=pages)); continue
 
             cached = db.find_cached(conn, sha, oh)
             if cached:
