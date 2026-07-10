@@ -1,14 +1,21 @@
 import time
+from bisect import bisect_left
+
 import pytest
 from app import config, db
 
 
-@pytest.fixture
-def conn(tmp_path, monkeypatch):
+def _use_tmp_data(monkeypatch, tmp_path):
+    """config의 데이터 경로를 tmp_path로 돌린다. 스토리지 생성은 호출자가 결정."""
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(config, "DB_PATH", tmp_path / "app.db")
     monkeypatch.setattr(config, "UPLOADS_DIR", tmp_path / "uploads")
     monkeypatch.setattr(config, "RESULTS_DIR", tmp_path / "results")
+
+
+@pytest.fixture
+def conn(tmp_path, monkeypatch):
+    _use_tmp_data(monkeypatch, tmp_path)
     config.ensure_dirs()
     db.init_db()
     c = db.connect()
@@ -72,7 +79,7 @@ def test_finish_job_sets_n_tables_n_images(conn):
     assert row["n_images"] == 5
 
 
-def test_active_before_counts_queued_and_running_only(conn):
+def test_active_created_ats_lists_queued_and_running_only(conn):
     db.create_job(conn, id="j1", session_id="s1", filename="f.pdf", sha256="a",
                    opts_hash="o", status="queued", page_total=1, result_dir=None)
     conn.execute("UPDATE jobs SET created_at=? WHERE id=?", (100.0, "j1"))
@@ -83,12 +90,13 @@ def test_active_before_counts_queued_and_running_only(conn):
                   opts_hash="o", status="done", page_total=1, result_dir=None)
     conn.execute("UPDATE jobs SET created_at=? WHERE id=?", (300.0, "j3"))
     conn.commit()
-    # before 250: j1(queued, 100) and j2(running, 200) count; j3 is done -> excluded
-    assert db.active_before(conn, 250.0) == 2
-    # before 150: only j1
-    assert db.active_before(conn, 150.0) == 1
-    # before 100: nothing strictly before
-    assert db.active_before(conn, 100.0) == 0
+    # j1(queued) and j2(running) are active in created_at order; j3 is done -> excluded
+    actives = db.active_created_ats(conn)
+    assert actives == [100.0, 200.0]
+    # bisect_left == "strictly before" count, matching the ahead semantics in _serialize
+    assert bisect_left(actives, 250.0) == 2
+    assert bisect_left(actives, 150.0) == 1
+    assert bisect_left(actives, 100.0) == 0
 
 
 def test_worker_busy(conn):
@@ -370,12 +378,10 @@ from fastapi.testclient import TestClient
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(config, "DB_PATH", tmp_path / "app.db")
-    monkeypatch.setattr(config, "UPLOADS_DIR", tmp_path / "uploads")
-    monkeypatch.setattr(config, "RESULTS_DIR", tmp_path / "results")
+    _use_tmp_data(monkeypatch, tmp_path)
     monkeypatch.setattr(config, "ADMIN_KEY", "secret")
-    config.ensure_dirs(); db.init_db()
+    config.ensure_dirs()
+    db.init_db()
     from app import web
     return TestClient(web.app)
 
@@ -473,6 +479,102 @@ def test_jobs_response_has_busy_and_ahead(client):
     assert mine[0]["ahead"] >= 1
 
 
+def test_events_sends_keepalive_when_nothing_changed(client):
+    # SSE는 변경/running이 있을 때만 데이터 프레임을 보내고, 그 외엔 코멘트로 연결만
+    # 유지한다(클라이언트가 매 틱 재렌더하지 않게). 첫 프레임은 busy 초기값 전달용.
+    import asyncio
+    from app import web
+
+    class Req:
+        cookies = {"sid": "s"}
+        headers = {}
+
+    async def first_two():
+        resp = await web.events(Req())
+        out = []
+        async for chunk in resp.body_iterator:
+            out.append(chunk)
+            if len(out) == 2:
+                break
+        await resp.body_iterator.aclose()
+        return out
+
+    first, second = asyncio.run(first_two())
+    assert first.startswith("data: ")
+    assert second.startswith(": ")
+
+
+def test_events_resends_queued_jobs_when_ahead_shrinks(client):
+    # 앞선 잡이 끝나면 뒤 queued 잡의 대기 순번이 줄어든다. 그 변화도 전송되어야
+    # UI의 "앞에 N개 대기"가 낡은 값으로 굳지 않는다.
+    import asyncio
+    import json
+    from app import web
+
+    class Req:
+        cookies = {"sid": "s"}
+        headers = {}
+
+    conn = db.connect()
+    for i, t in enumerate([100.0, 200.0, 300.0]):
+        db.create_job(conn, id=f"j{i}", session_id="s", filename="f.pdf", sha256="a",
+                      opts_hash="o", status="queued", page_total=1)
+        conn.execute("UPDATE jobs SET created_at=? WHERE id=?", (t, f"j{i}"))
+    conn.commit()
+
+    async def two_frames():
+        resp = await web.events(Req())
+        it = resp.body_iterator
+        first = await it.__anext__()
+        db.finish_job(conn, "j0", status="done")  # 맨 앞 잡 완료
+        second = await it.__anext__()
+        await it.aclose()
+        return first, second
+
+    first, second = asyncio.run(two_frames())
+    conn.close()
+    aheads = {j["id"]: j.get("ahead") for j in json.loads(first[6:])["jobs"]}
+    assert aheads == {"j0": 0, "j1": 1, "j2": 2}
+    aheads = {j["id"]: j.get("ahead") for j in json.loads(second[6:])["jobs"]}
+    assert aheads["j1"] == 0 and aheads["j2"] == 1
+
+
+def test_events_does_not_resend_unchanged_done_jobs(client):
+    # ahead는 queued에만 의미가 있다. done 잡에도 순번을 매기면 앞의 활성 잡이 끝날
+    # 때마다 값이 흔들려, 변한 게 없는 done 카드가 계속 재전송된다.
+    import asyncio
+    import json
+    from app import web
+
+    class Req:
+        cookies = {"sid": "s"}
+        headers = {}
+
+    conn = db.connect()
+    db.create_job(conn, id="q1", session_id="s", filename="a.pdf", sha256="a",
+                  opts_hash="o", status="queued", page_total=1)
+    conn.execute("UPDATE jobs SET created_at=100.0 WHERE id='q1'")
+    db.create_job(conn, id="d1", session_id="s", filename="b.pdf", sha256="b",
+                  opts_hash="o", status="done", page_total=1)  # 캐시 히트: 나중에 생성된 done
+    conn.execute("UPDATE jobs SET created_at=200.0, finished_at=201.0 WHERE id='d1'")
+    conn.commit()
+
+    async def second_frame():
+        resp = await web.events(Req())
+        it = resp.body_iterator
+        await it.__anext__()                      # 초기 스냅샷
+        db.finish_job(conn, "q1", status="done")  # 유일한 활성 잡이 사라짐
+        frame = await it.__anext__()
+        await it.aclose()
+        return frame
+
+    frame = asyncio.run(second_frame())
+    conn.close()
+    ids = [j["id"] for j in json.loads(frame[6:])["jobs"]]
+    assert "q1" in ids  # 실제로 바뀐 잡은 전송된다
+    assert "d1" not in ids  # 변화 없는 done 잡은 전송하지 않는다
+
+
 def test_download_all_zips_done_jobs(client):
     r1 = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
                      data={"include_images": "true", "include_tables_csv": "true"})
@@ -551,10 +653,7 @@ def test_web_self_initializes_storage_without_worker(tmp_path, monkeypatch):
     # worker가 아직 ensure_dirs()/init_db()를 실행하지 않은 상황을 재현: 이 테스트는
     # (client 픽스처와 달리) db.init_db()를 직접 호출하지 않는다. web이 자기 스토리지를
     # 스스로 초기화하지 못하면 DB 파일이 없어 /api/jobs가 500을 낸다.
-    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(config, "DB_PATH", tmp_path / "app.db")
-    monkeypatch.setattr(config, "UPLOADS_DIR", tmp_path / "uploads")
-    monkeypatch.setattr(config, "RESULTS_DIR", tmp_path / "results")
+    _use_tmp_data(monkeypatch, tmp_path)
     assert not (tmp_path / "app.db").exists()
 
     from app import web

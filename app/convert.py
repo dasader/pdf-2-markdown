@@ -5,7 +5,7 @@ from pathlib import Path
 import pypdfium2  # docling이 이미 의존하는 PDF 백엔드
 
 
-def _sha256_bytes(data: bytes) -> str:
+def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 

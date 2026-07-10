@@ -7,6 +7,7 @@ import hmac
 import asyncio
 import zipfile
 import tempfile
+from bisect import bisect_left
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -45,8 +46,11 @@ def _is_admin(request: Request) -> bool:
     return bool(config.ADMIN_KEY) and hmac.compare_digest(key, config.ADMIN_KEY)
 
 
-def _serialize(conn, r) -> dict:
-    """행 직렬화 + 진행률(추정) + queued 잡의 전역 대기 순번(ahead)."""
+def _serialize(actives, r) -> dict:
+    """행 직렬화 + 진행률(추정) + queued 잡의 전역 대기 순번(ahead).
+
+    actives: db.active_created_ats()의 오름차순 목록.
+    """
     d = dict(r)
     if d["status"] == "done":
         d["progress"] = 100
@@ -56,10 +60,14 @@ def _serialize(conn, r) -> dict:
     else:
         d["progress"] = 0
     if d["status"] == "queued":
-        d["ahead"] = db.active_before(conn, r["created_at"])
+        d["ahead"] = bisect_left(actives, r["created_at"])
     d.pop("session_id", None)
     d.pop("result_dir", None)  # 서버 절대경로, UI/테스트 모두 미사용
     return d
+
+
+def _set_sid_cookie(response, sid: str) -> None:
+    response.set_cookie("sid", sid, httponly=True, samesite="lax", max_age=30 * 86400)
 
 
 def _safe_name(name: str) -> str:
@@ -79,9 +87,13 @@ def index(request: Request):
     # 재발급되는 sid와 어긋나서 진행률이 안 보이는 문제가 없다.
     sid = request.cookies.get("sid")
     if not sid:
-        sid = uuid.uuid4().hex
-        response.set_cookie("sid", sid, httponly=True, samesite="lax", max_age=30 * 86400)
+        _set_sid_cookie(response, uuid.uuid4().hex)
     return response
+
+
+_TOO_BIG = f"파일이 {config.MAX_BYTES // (1024 * 1024)}MB를 초과합니다"
+_TOO_MANY_PAGES = f"{config.MAX_PAGES}페이지를 초과합니다"
+_TOO_MANY_QUEUED = f"대기 잡이 너무 많습니다(최대 {config.MAX_QUEUED_PER_SESSION})"
 
 
 def _fail(conn, jid, sid, filename, oh, error, *, sha="-", page_total=None):
@@ -109,20 +121,17 @@ async def create_jobs(request: Request,
             # 확인해 초대형 업로드를 메모리에 통째로 읽기 전에 걸러낸다(OOM 방지).
             # uf.size가 없는(None) 경우에만 아래 read() 이후 len(data) 체크가 백스톱.
             if uf.size is not None and uf.size > config.MAX_BYTES:
-                out.append(_fail(conn, jid, sid, uf.filename, oh,
-                                 "파일이 100MB를 초과합니다")); continue
+                out.append(_fail(conn, jid, sid, uf.filename, oh, _TOO_BIG)); continue
             data = await uf.read()
             if len(data) > config.MAX_BYTES:
-                out.append(_fail(conn, jid, sid, uf.filename, oh,
-                                 "파일이 100MB를 초과합니다")); continue
+                out.append(_fail(conn, jid, sid, uf.filename, oh, _TOO_BIG)); continue
             if not convert.is_pdf(data[:5]):
                 out.append(_fail(conn, jid, sid, uf.filename, oh,
                                  "PDF 파일이 아닙니다")); continue
             if db.count_queued(conn, sid) >= config.MAX_QUEUED_PER_SESSION:
-                out.append(_fail(conn, jid, sid, uf.filename, oh,
-                                 "대기 잡이 너무 많습니다(최대 20)")); continue
+                out.append(_fail(conn, jid, sid, uf.filename, oh, _TOO_MANY_QUEUED)); continue
 
-            sha = convert._sha256_bytes(data)
+            sha = convert.sha256_bytes(data)
             pdf_path = config.UPLOADS_DIR / f"{sha}.pdf"
             if not pdf_path.exists():
                 pdf_path.write_bytes(data)
@@ -133,7 +142,7 @@ async def create_jobs(request: Request,
                                  "PDF를 열 수 없습니다", sha=sha)); continue
             if pages > config.MAX_PAGES:
                 out.append(_fail(conn, jid, sid, uf.filename, oh,
-                                 "500페이지를 초과합니다", sha=sha, page_total=pages)); continue
+                                 _TOO_MANY_PAGES, sha=sha, page_total=pages)); continue
 
             cached = db.find_cached(conn, sha, oh)
             if cached:
@@ -147,11 +156,12 @@ async def create_jobs(request: Request,
                 db.create_job(conn, id=jid, session_id=sid, filename=uf.filename,
                               sha256=sha, opts_hash=oh, status="queued", page_total=pages)
             out.append(db.get_job(conn, jid))
-        result = [_serialize(conn, r) for r in out]
+        actives = db.active_created_ats(conn)
+        result = [_serialize(actives, r) for r in out]
     finally:
         conn.close()
     response = JSONResponse(result)
-    response.set_cookie("sid", sid, httponly=True, samesite="lax", max_age=30 * 86400)
+    _set_sid_cookie(response, sid)
     return response
 
 
@@ -160,8 +170,9 @@ def list_jobs(request: Request):
     conn = db.connect()
     try:
         rows = db.list_jobs(conn, _sid(request), admin=_is_admin(request))
+        actives = db.active_created_ats(conn)
         return JSONResponse({
-            "jobs": [_serialize(conn, r) for r in rows],
+            "jobs": [_serialize(actives, r) for r in rows],
             "busy": db.worker_busy(conn),
         })
     finally:
@@ -253,25 +264,32 @@ async def events(request: Request):
         # 이벤트 루프에 맡긴다. 내부 sqlite 읽기는 매우 빨라(수 ms 이하) 루프를
         # 잠깐 블로킹해도 이 내부용 도구 규모에서는 감수 가능한 트레이드오프.
         seen = {}
-        for _ in range(600):  # 최대 5분 후 재연결 유도
-            conn = db.connect()
-            try:
+        last_busy = None
+        conn = db.connect()
+        try:
+            for _ in range(600):  # 최대 5분 후 재연결 유도
                 rows = db.list_jobs(conn, sid, admin=admin)
                 busy = db.worker_busy(conn)
-                changed = []
+                actives = db.active_created_ats(conn)
+                payload = {}
                 for r in rows:
-                    key = (r["status"], r["finished_at"])
-                    if seen.get(r["id"]) != key:
+                    # ahead를 키에 포함해야, 앞선 잡이 끝나 대기 순번이 줄었을 때 그 뒤
+                    # queued 잡들도 갱신 프레임을 받는다. _serialize와 같이 queued에만
+                    # 계산한다 — done 잡에도 매기면 활성 잡이 빠질 때마다 값이 흔들려
+                    # 변한 게 없는 카드가 계속 재전송된다.
+                    ahead = bisect_left(actives, r["created_at"]) if r["status"] == "queued" else 0
+                    key = (r["status"], r["finished_at"], ahead)
+                    # running 잡은 진행률이 계속 변하므로 변경 여부와 무관하게 항상 포함
+                    if seen.get(r["id"]) != key or r["status"] == "running":
                         seen[r["id"]] = key
-                        changed.append(_serialize(conn, r))
-                # running 잡은 진행률이 계속 변하므로 항상 포함
-                running = {r["id"]: _serialize(conn, r) for r in rows if r["status"] == "running"}
-            finally:
-                conn.close()
-            payload = {c["id"]: c for c in changed}
-            payload.update(running)
-            # busy가 하트비트 역할을 하므로 변경이 없어도 매 틱 전송
-            yield f"data: {json.dumps({'jobs': list(payload.values()), 'busy': busy})}\n\n"
-            await asyncio.sleep(0.5)
+                        payload[r["id"]] = _serialize(actives, r)
+                if payload or busy != last_busy:
+                    last_busy = busy
+                    yield f"data: {json.dumps({'jobs': list(payload.values()), 'busy': busy})}\n\n"
+                else:
+                    yield ": keepalive\n\n"  # 변화 없음 — 클라이언트 재렌더 없이 연결만 유지
+                await asyncio.sleep(0.5)
+        finally:
+            conn.close()
 
     return StreamingResponse(gen(), media_type="text/event-stream")

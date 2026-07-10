@@ -39,20 +39,6 @@
     --run-soft:rgba(233,150,74,.14); --done-soft:rgba(82,158,126,.14);
   }
 }
-:root[data-theme="dark"] {
-  --paper:#191919; --surface:#202020; --surface-2:#2a2a28;
-  --ink:#e9e8e5; --ink-muted:#979693; --ink-faint:#6f6e6b;
-  --line:#2e2e2c; --line-2:#383835;
-  --wait:#6f6e6b; --run:#e9964a; --done:#529e7e; --fail:#eb5757;
-  --run-soft:rgba(233,150,74,.14); --done-soft:rgba(82,158,126,.14);
-}
-:root[data-theme="light"] {
-  --paper:#ffffff; --surface:#f7f6f3; --surface-2:#efeee9;
-  --ink:#37352f; --ink-muted:#787774; --ink-faint:#9b9a97;
-  --line:#eae9e5; --line-2:#e0dfda;
-  --wait:#9b9a97; --run:#d9730d; --done:#448361; --fail:#e03e3e;
-  --run-soft:rgba(217,115,13,.12); --done-soft:rgba(68,131,97,.12);
-}
 
 * { box-sizing:border-box; }
 body {

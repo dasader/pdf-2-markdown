@@ -120,10 +120,11 @@ def referenced_result_dirs(conn):
             conn.execute("SELECT DISTINCT result_dir FROM jobs WHERE result_dir IS NOT NULL")}
 
 
-def active_before(conn, created_at) -> int:
-    return conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE created_at < ? AND status IN ('queued', 'running')",
-        (created_at,)).fetchone()[0]
+def active_created_ats(conn) -> list[float]:
+    # 대기 잡마다 COUNT(*)를 날리는 대신, 한 번 정렬해 받아 bisect로 순번을 매긴다.
+    return [r[0] for r in conn.execute(
+        "SELECT created_at FROM jobs WHERE status IN ('queued', 'running') "
+        "ORDER BY created_at")]
 
 
 def worker_busy(conn) -> bool:
