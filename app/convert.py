@@ -34,21 +34,24 @@ def opts_hash(include_images: bool, include_tables_csv: bool) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
-def _build_converter(low_mem: bool = False):
+def _build_converter():
     # 지연 import: 테스트가 torch 없이 돌게 함.
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
     from docling.datamodel.settings import settings
     from docling.document_converter import DocumentConverter, PdfFormatOption
 
-    # 저사양 호스트(3GB 워커) 메모리 최적화 — 실측으로 검증한 레버는 page_batch_size=1
-    # (페이지를 1장씩 처리해 피크 메모리를 대폭 낮춘다)과 do_ocr=False다.
-    #
-    # 백엔드는 docling 기본값(DoclingParseDocumentBackend)을 쓴다. 한때 더 가벼워 보이는
+    # 백엔드는 docling 기본값(DoclingParseDocumentBackend)을 쓴다. 한때 더 가벼운
     # PyPdfiumDocumentBackend로 바꿨었으나, 그 백엔드는 텍스트 셀 추출까지 pdfium의
     # word 단위 분할에 맡겨 한글처럼 글자 bbox가 겹치는 조판에서 어절 끝 음절을 다음
     # 단어에 다시 붙인다("저물고," → "저물고, 고,"). 본문·표·CSV가 모두 오염됐다.
-    # 실측: 11p 한글 문서 peak RSS 1870MB(pypdfium) vs 1991MB(기본) — 3GB 안에 여유.
+    #
+    # 메모리(3GB 워커): do_ocr=False가 가장 큰 레버(~2GB 절감). page_batch_size=1은
+    # 여러 페이지를 동시에 들지 않게 하지만, 한 페이지가 통째로 무거우면 못 막는다.
+    # ponytail: 이미지 객체가 수십만 개인 병리적 페이지(실측: 27p 문서의 한 페이지에
+    # 609,831개)는 백엔드의 비트맵 파싱만으로 4GB를 써 3GB 안에 못 들어온다. 그런
+    # 문서는 worker가 재시도 없이 실패시킨다(_MAX_ATTEMPTS=1). 살려야 한다면 워커
+    # mem_limit을 7GB 이상으로 올려야 한다 — 실측 peak 6.1GB.
     settings.perf.page_batch_size = 1
 
     opts = PdfPipelineOptions()
@@ -56,32 +59,26 @@ def _build_converter(low_mem: bool = False):
     opts.do_table_structure = True
     opts.table_structure_options.mode = TableFormerMode.ACCURATE
     opts.images_scale = 1.25
-    # low_mem: 위 최적화로도 부족한 극단적 문서의 재시도. 그림 크롭 생성을 꺼(가장 큰
-    # 메모리 절감) 텍스트·표만이라도 통과시킨다.
-    opts.generate_picture_images = not low_mem
     return DocumentConverter(
         format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
     )
 
 
-def convert(pdf_path, out_dir, *, include_images: bool, include_tables_csv: bool,
-            low_mem: bool = False):
+def convert(pdf_path, out_dir, *, include_images: bool, include_tables_csv: bool):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     md_path = out_dir / "doc.md"
 
-    result = _build_converter(low_mem=low_mem).convert(str(pdf_path))
+    result = _build_converter().convert(str(pdf_path))
     doc = result.document
 
-    # low_mem에선 그림 크롭을 생성하지 않으므로 이미지 참조도 남기지 않는다(텍스트·표만).
-    emit_images = include_images and not low_mem
     try:
         # docling_core is a light, torch-free dependency of docling itself;
         # optional here so unit tests (fake converter, no docling installed) still run.
         from docling_core.types.doc import ImageRefMode
-        image_mode = ImageRefMode.REFERENCED if emit_images else ImageRefMode.PLACEHOLDER
+        image_mode = ImageRefMode.REFERENCED if include_images else ImageRefMode.PLACEHOLDER
     except ImportError:
-        image_mode = "referenced" if emit_images else "placeholder"
+        image_mode = "referenced" if include_images else "placeholder"
     # artifacts_dir="images"로 직접 지정 → doc.md에 상대경로(images/...)가 그대로 기록됨
     # (폴더 rename + 텍스트 치환은 절대경로가 남는 버그가 있어 제거).
     doc.save_as_markdown(str(md_path), artifacts_dir=Path("images"), image_mode=image_mode)
