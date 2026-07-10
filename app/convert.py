@@ -1,4 +1,5 @@
 import hashlib
+import html
 import zipfile
 from pathlib import Path
 
@@ -21,24 +22,33 @@ def page_count(path) -> int:
         doc.close()
 
 
+# 변환 결과물이 달라지는 변경을 하면 올린다. opts_hash에 섞이므로 find_cached가 옛
+# 결과를 더는 찾지 못해 캐시가 자연히 무효화된다(수동 삭제 불필요).
+#   rev 2: docling 기본 백엔드로 복귀(pypdfium 백엔드가 한글 음절을 중복 삽입) +
+#          마크다운 HTML 언이스케이프
+CONVERTER_REV = 2
+
+
 def opts_hash(include_images: bool, include_tables_csv: bool) -> str:
-    key = f"img={int(include_images)};csv={int(include_tables_csv)}"
+    key = f"rev={CONVERTER_REV};img={int(include_images)};csv={int(include_tables_csv)}"
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
 def _build_converter(low_mem: bool = False):
     # 지연 import: 테스트가 torch 없이 돌게 함.
-    from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
     from docling.datamodel.settings import settings
     from docling.document_converter import DocumentConverter, PdfFormatOption
 
-    # 저사양 호스트(3GB 워커) 메모리 최적화 — 실측으로 검증한 두 레버:
-    # ① page_batch_size=1: 페이지를 1장씩 처리해 피크 메모리를 대폭 낮춘다.
-    # ② PyPdfiumDocumentBackend: 기본 DoclingParse보다 가벼운 PDF 백엔드(이미지 조밀
-    #    문서의 메모리 주범을 해소). 둘을 합치면 14MB·27p 문서도 3GB 안에서 풀 품질로 변환됨
-    #    (백엔드 교체로 표·텍스트 품질 저하 없음 — 실측 확인).
+    # 저사양 호스트(3GB 워커) 메모리 최적화 — 실측으로 검증한 레버는 page_batch_size=1
+    # (페이지를 1장씩 처리해 피크 메모리를 대폭 낮춘다)과 do_ocr=False다.
+    #
+    # 백엔드는 docling 기본값(DoclingParseDocumentBackend)을 쓴다. 한때 더 가벼워 보이는
+    # PyPdfiumDocumentBackend로 바꿨었으나, 그 백엔드는 텍스트 셀 추출까지 pdfium의
+    # word 단위 분할에 맡겨 한글처럼 글자 bbox가 겹치는 조판에서 어절 끝 음절을 다음
+    # 단어에 다시 붙인다("저물고," → "저물고, 고,"). 본문·표·CSV가 모두 오염됐다.
+    # 실측: 11p 한글 문서 peak RSS 1870MB(pypdfium) vs 1991MB(기본) — 3GB 안에 여유.
     settings.perf.page_batch_size = 1
 
     opts = PdfPipelineOptions()
@@ -50,8 +60,7 @@ def _build_converter(low_mem: bool = False):
     # 메모리 절감) 텍스트·표만이라도 통과시킨다.
     opts.generate_picture_images = not low_mem
     return DocumentConverter(
-        format_options={InputFormat.PDF: PdfFormatOption(
-            backend=PyPdfiumDocumentBackend, pipeline_options=opts)}
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
     )
 
 
@@ -76,6 +85,8 @@ def convert(pdf_path, out_dir, *, include_images: bool, include_tables_csv: bool
     # artifacts_dir="images"로 직접 지정 → doc.md에 상대경로(images/...)가 그대로 기록됨
     # (폴더 rename + 텍스트 치환은 절대경로가 남는 버그가 있어 제거).
     doc.save_as_markdown(str(md_path), artifacts_dir=Path("images"), image_mode=image_mode)
+    # docling이 본문을 HTML 이스케이프한 채 마크다운에 내보낸다("R&amp;D"). 되돌린다.
+    md_path.write_text(html.unescape(md_path.read_text(encoding="utf-8")), encoding="utf-8")
 
     n_tables = len(getattr(doc, "tables", None) or [])
     tables_dir = out_dir / "tables"

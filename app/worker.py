@@ -24,9 +24,15 @@ def process_one(conn) -> bool:
     pdf_path = config.UPLOADS_DIR / f"{sha}.pdf"
     out_dir = config.RESULTS_DIR / f"{sha}-{opts}"
     # ponytail: opts 4조합 역산, 조합이 늘면 컬럼 추가
-    include_images, include_csv = next(
-        ((i, c) for i in (True, False) for c in (True, False)
-         if convert.opts_hash(i, c) == opts), (False, False))
+    pair = next(((i, c) for i in (True, False) for c in (True, False)
+                 if convert.opts_hash(i, c) == opts), None)
+    if pair is None:
+        # CONVERTER_REV가 올라간 뒤 남아있던 옛 queued 잡. 옵션을 복원할 수 없으므로
+        # 조용히 기본값으로 변환해 요청과 다른 결과를 내보내는 대신 실패시킨다.
+        db.finish_job(conn, job["id"], status="failed",
+                      error="변환기가 업데이트되었습니다. 다시 업로드해 주세요.")
+        return True
+    include_images, include_csv = pair
     # 1차(attempts 0)는 정상, 재시도(attempts>=1)는 저사양 모드 — OOM으로 죽었던
     # 문서라도 그림 추출을 꺼 텍스트·표만이라도 메모리 안에 통과시킨다.
     low_mem = attempts >= 1

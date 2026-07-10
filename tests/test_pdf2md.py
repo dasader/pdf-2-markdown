@@ -138,6 +138,14 @@ def test_opts_hash_stable_and_distinct():
     assert a != convert.opts_hash(True, False)
 
 
+def test_opts_hash_changes_with_converter_rev(monkeypatch):
+    # CONVERTER_REV를 올리면 opts_hash가 달라져 find_cached가 옛 결과를 못 찾는다.
+    # 변환 로직이 바뀌었을 때 캐시가 스스로 무효화되는 유일한 장치.
+    before = convert.opts_hash(True, True)
+    monkeypatch.setattr(convert, "CONVERTER_REV", convert.CONVERTER_REV + 1)
+    assert convert.opts_hash(True, True) != before
+
+
 def test_convert_packages_zip(tmp_path, monkeypatch):
     # docling을 가짜로 대체: doc.md만 쓰고 tables/pictures 없음.
     class FakeDoc:
@@ -270,6 +278,20 @@ def test_process_one_success(conn, tmp_path, monkeypatch):
     assert row["result_dir"] == called["out"]
     assert row["n_tables"] == 3
     assert row["n_images"] == 1
+
+
+def test_process_one_fails_job_with_undecodable_opts_hash(conn, monkeypatch):
+    # CONVERTER_REV가 오른 뒤 남아있던 옛 queued 잡: opts_hash를 4조합 어디에도 되짚을
+    # 수 없다. 조용히 기본 옵션으로 변환하지 말고 실패시켜야 한다.
+    _job(conn, "j1", sha="Y", opts="STALE-REV-1", status="queued")
+    (config.UPLOADS_DIR / "Y.pdf").write_bytes(b"%PDF-1.7")
+    def never(*a, **k): raise AssertionError("옛 잡을 변환하면 안 된다")
+    monkeypatch.setattr(worker.convert, "convert", never)
+
+    assert worker.process_one(conn) is True
+    row = db.get_job(conn, "j1")
+    assert row["status"] == "failed"
+    assert "다시 업로드" in row["error"]
 
 
 def test_process_one_failure_records_error(conn, monkeypatch):
