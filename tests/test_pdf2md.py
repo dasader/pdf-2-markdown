@@ -146,6 +146,19 @@ def test_opts_hash_changes_with_converter_rev(monkeypatch):
     assert convert.opts_hash(True, True) != before
 
 
+def test_build_converter_pipeline_options():
+    # docling 기본값은 generate_picture_images=False다. 이 줄이 지워지면 그림이 통째로
+    # 누락되는데, n_images는 크롭이 아니라 인식된 그림 영역 수를 세므로 눈치채기 어렵다.
+    pytest.importorskip("docling")
+    from docling.datamodel.base_models import InputFormat
+
+    conv = convert._build_converter()
+    opts = conv.format_to_options[InputFormat.PDF].pipeline_options
+    assert opts.generate_picture_images is True
+    assert opts.do_table_structure is True
+    assert opts.do_ocr is False
+
+
 def test_convert_packages_zip(tmp_path, monkeypatch):
     # docling을 가짜로 대체: doc.md만 쓰고 tables/pictures 없음.
     class FakeDoc:
@@ -321,26 +334,11 @@ def test_requeue_running_increments_attempts(conn):
     assert db.get_job(conn, "j1")["attempts"] == 2
 
 
-def test_process_one_retry_uses_low_mem(conn, monkeypatch):
-    # attempts=1인 재시도는 저사양 모드(low_mem=True)로 변환한다.
+def test_process_one_fails_after_max_attempts(conn, monkeypatch):
+    # 워커를 한 번 죽인(OOM) 문서는 재시도하지 않고 바로 실패로 마감한다. 저사양
+    # 재시도는 메모리를 못 줄여(실측 6.1GB→6.2GB) 워커만 한 번 더 죽였다.
     _job(conn, "j1", sha="Y", opts="O", status="queued")
     conn.execute("UPDATE jobs SET attempts=1 WHERE id='j1'"); conn.commit()
-    (config.UPLOADS_DIR / "Y.pdf").write_bytes(b"%PDF-1.7")
-    seen = {}
-    def fake_convert(pdf, out, **kw):
-        seen.update(kw); Path(out).mkdir(parents=True, exist_ok=True); return (2, 0)
-    monkeypatch.setattr(worker.convert, "convert", fake_convert)
-    monkeypatch.setattr(worker.convert, "opts_hash", lambda *a: "O")
-
-    assert worker.process_one(conn) is True
-    assert seen.get("low_mem") is True
-    assert db.get_job(conn, "j1")["status"] == "done"
-
-
-def test_process_one_fails_after_max_attempts(conn, monkeypatch):
-    # attempts가 상한에 도달하면 변환을 시도하지 않고 실패로 마감(무한 재시도 방지).
-    _job(conn, "j1", sha="Y", opts="O", status="queued")
-    conn.execute("UPDATE jobs SET attempts=2 WHERE id='j1'"); conn.commit()
     called = {"n": 0}
     def fake_convert(*a, **k):
         called["n"] += 1; return (0, 0)
@@ -349,6 +347,9 @@ def test_process_one_fails_after_max_attempts(conn, monkeypatch):
 
     assert worker.process_one(conn) is True
     assert called["n"] == 0  # convert 미호출
+    row = db.get_job(conn, "j1")
+    assert row["status"] == "failed"
+    assert "너무 무거워" in row["error"]
     row = db.get_job(conn, "j1")
     assert row["status"] == "failed"
     assert "메모리" in row["error"]
