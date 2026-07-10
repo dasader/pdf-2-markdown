@@ -26,7 +26,8 @@ def page_count(path) -> int:
 # 결과를 더는 찾지 못해 캐시가 자연히 무효화된다(수동 삭제 불필요).
 #   rev 2: docling 기본 백엔드로 복귀(pypdfium 백엔드가 한글 음절을 중복 삽입) +
 #          마크다운 HTML 언이스케이프
-CONVERTER_REV = 2
+#   rev 3: generate_picture_images 복구 — rev 2 캐시에는 그림이 없다
+CONVERTER_REV = 3
 
 
 def opts_hash(include_images: bool, include_tables_csv: bool) -> str:
@@ -59,6 +60,7 @@ def _build_converter():
     opts.do_table_structure = True
     opts.table_structure_options.mode = TableFormerMode.ACCURATE
     opts.images_scale = 1.25
+    opts.generate_picture_images = True       # docling 기본값이 False — 끄면 그림이 통째로 누락
     return DocumentConverter(
         format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
     )

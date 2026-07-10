@@ -146,6 +146,19 @@ def test_opts_hash_changes_with_converter_rev(monkeypatch):
     assert convert.opts_hash(True, True) != before
 
 
+def test_build_converter_pipeline_options():
+    # docling 기본값은 generate_picture_images=False다. 이 줄이 지워지면 그림이 통째로
+    # 누락되는데, n_images는 크롭이 아니라 인식된 그림 영역 수를 세므로 눈치채기 어렵다.
+    pytest.importorskip("docling")
+    from docling.datamodel.base_models import InputFormat
+
+    conv = convert._build_converter()
+    opts = conv.format_to_options[InputFormat.PDF].pipeline_options
+    assert opts.generate_picture_images is True
+    assert opts.do_table_structure is True
+    assert opts.do_ocr is False
+
+
 def test_convert_packages_zip(tmp_path, monkeypatch):
     # docling을 가짜로 대체: doc.md만 쓰고 tables/pictures 없음.
     class FakeDoc:

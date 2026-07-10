@@ -18,5 +18,8 @@ services:
     command: python -m app.worker
     volumes:
       - ./data:/data
-    mem_limit: 3g
+    # 실측 peak: 11p 2.0GB / 51p 2.6GB / 178p·표87개 3.9GB(그림 크롭 포함).
+    # 3g면 178p 보고서가 OOM으로 죽는다. 한 페이지에 이미지 객체가 수십만 개인
+    # 병리적 문서는 6.1GB를 써 5g로도 못 살린다 — worker가 재시도 없이 실패시킨다.
+    mem_limit: 5g
     restart: unless-stopped
