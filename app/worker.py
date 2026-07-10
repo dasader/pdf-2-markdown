@@ -65,7 +65,8 @@ def run() -> None:
         worked = process_one(conn)
         now = time.time()
         if now - last_sweep > _SWEEP_EVERY:
-            sweep(conn); last_sweep = now
+            sweep(conn)
+            last_sweep = now
         if not worked:
             time.sleep(1)
 
