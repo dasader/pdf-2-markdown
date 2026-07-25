@@ -146,6 +146,62 @@ def test_opts_hash_changes_with_converter_rev(monkeypatch):
     assert convert.opts_hash(True, True) != before
 
 
+def test_fix_bullets():
+    md = "\n".join([
+        "- □ (배경) 기술패권 경쟁",
+        "- ㅇ 주요국은 전략기술 분야를 선정",
+        "- ㅇ",                                    # 기호만, 본문은 다음 줄
+        "- 별지와 같이 상정함",
+        "- → 관련 정책 추진중",                    # 불릿 기호가 아님 — 건드리지 않는다
+        "| <1> 반도체 | ▪ 고용량 메모리 |",        # 표 행 — 건드리지 않는다
+        "## 제목",
+    ])
+    out = convert._fix_bullets(md).split("\n")
+    assert out[0] == "- (배경) 기술패권 경쟁"        # □ → 0단계
+    assert out[1] == "  - 주요국은 전략기술 분야를 선정"  # ㅇ → 1단계
+    assert out[2] == "- 별지와 같이 상정함"          # 빈 불릿 줄은 사라짐
+    assert out[3] == "- → 관련 정책 추진중"
+    assert out[4] == "| <1> 반도체 | ▪ 고용량 메모리 |"
+    assert out[5] == "## 제목"
+
+
+def test_fix_bullets_symbol_l():
+    md = "\n".join([
+        "- l (구성) 위원장 및 부위원장",   # Wingdings 'l'(▪) → 심볼 제거
+        "- l",                            # 기호만 → 사라짐
+        "- long-term 전략은 유지",         # 실제 'l' 낱말 — 건드리지 않는다
+    ])
+    out = convert._fix_bullets(md).split("\n")
+    assert out[0] == "- (구성) 위원장 및 부위원장"
+    assert out[1] == "- long-term 전략은 유지"
+
+
+def test_despace():
+    # 실제 변환 출력에서 가져온 자간 깨짐 사례. 두 칸=어절 경계, 한 칸=자간.
+    assert convert._despace("글 로 벌  기 술 패 권  경 쟁") == "글로벌 기술패권 경쟁"
+    assert convert._despace("고 도 화  및  제 도 혁 신") == "고도화 및 제도혁신"
+    # 정상 국문(어절 사이 한 칸, 음절은 붙음)은 건드리지 않는다.
+    assert convert._despace("국가 전략 기술 개발") == "국가 전략 기술 개발"
+    # 음절 3개 이하(임계 미만)는 오검을 피해 그대로 둔다.
+    assert convert._despace("심 화") == "심 화"
+    # 앞의 정상 어절(대한민국)을 자간 런에 흡수하지 않는다.
+    assert convert._despace("대한민국 과 학 기 술 주 권") == "대한민국 과학기술주권"
+    # 강조 조판의 세 칸 어절 경계도 접는다.
+    assert convert._despace("통 합   자 율   비 행 체") == "통합 자율 비행체"
+    # 세 칸으로 벌어진 정상(다음절) 어절은 건드리지 않는다.
+    assert convert._despace("국가   전략   기술   개발") == "국가   전략   기술   개발"
+
+
+def test_tighten():
+    assert convert._tighten("산 · 학 · 연") == "산·학·연"
+    assert convert._tighten("육성 · 확보") == "육성·확보"          # 어절 사이 가운뎃점도 붙임
+    assert convert._tighten("유사 ･ 중복") == "유사･중복"          # 반각 가운뎃점(U+FF65)
+    assert convert._tighten("제주 ( 그린수소 )") == "제주 (그린수소)"  # 괄호 안쪽만
+    assert convert._tighten("｢ 국가전략기술육성법 ｣") == "｢국가전략기술육성법｣"
+    assert convert._tighten("( ' 24~ ' 28)") == "('24~ '28)"  # 연도는 붙임(틸드 뒤 한 칸은 잔류)
+    assert convert._tighten("| 「법」, 과기정통부 |") == "| 「법」, 과기정통부 |"  # 정상 표 행 불변
+
+
 def test_build_converter_pipeline_options():
     # docling 기본값은 generate_picture_images=False다. 이 줄이 지워지면 그림이 통째로
     # 누락되는데, n_images는 크롭이 아니라 인식된 그림 영역 수를 세므로 눈치채기 어렵다.
@@ -153,10 +209,12 @@ def test_build_converter_pipeline_options():
     from docling.datamodel.base_models import InputFormat
 
     conv = convert._build_converter()
-    opts = conv.format_to_options[InputFormat.PDF].pipeline_options
-    assert opts.generate_picture_images is True
-    assert opts.do_table_structure is True
-    assert opts.do_ocr is False
+    fmt = conv.format_to_options[InputFormat.PDF]
+    assert fmt.pipeline_options.generate_picture_images is True
+    assert fmt.pipeline_options.do_table_structure is True
+    assert fmt.pipeline_options.do_ocr is False
+    # True(기본)면 낫표·괄호가 다른 폰트라는 이유로 본문에서 떨어져 나온다.
+    assert fmt.backend_options.enforce_same_font is False
 
 
 def test_convert_packages_zip(tmp_path, monkeypatch):
@@ -211,7 +269,7 @@ def test_convert_writes_table_csv_and_counts_n_tables(tmp_path, monkeypatch):
 
     class FakeTable:
         def export_to_dataframe(self, doc=None):
-            return pd.DataFrame({"a": [1, 2], "b": [3, 4]})
+            return pd.DataFrame({"기술분야": ["반도체", "양자"], "b": [3, 4]})
 
     class FakeDoc:
         tables = [FakeTable()]
@@ -230,7 +288,11 @@ def test_convert_writes_table_csv_and_counts_n_tables(tmp_path, monkeypatch):
         FIX, out, include_images=False, include_tables_csv=True)
     assert n_tables == 1
     assert n_images == 0
-    assert (out / "tables" / "table-01.csv").exists()
+    csv = out / "tables" / "table-01.csv"
+    assert csv.exists()
+    # BOM이 없으면 Excel이 시스템 인코딩(한국어 Windows는 CP949)으로 읽어 한글이 깨진다.
+    assert csv.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert "반도체" in csv.read_text(encoding="utf-8-sig")
     import zipfile
     names = zipfile.ZipFile(out / "result.zip").namelist()
     assert "tables/table-01.csv" in names
