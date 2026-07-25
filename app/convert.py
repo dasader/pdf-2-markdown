@@ -29,7 +29,10 @@ def page_count(path) -> int:
 #          마크다운 HTML 언이스케이프
 #   rev 3: generate_picture_images 복구 — rev 2 캐시에는 그림이 없다
 #   rev 4: 표 CSV를 utf-8-sig로 저장(Excel 한글 깨짐) + 공문서 불릿 기호를 들여쓰기로
-CONVERTER_REV = 4
+#   rev 5: PDF 자간(letter-spacing)으로 음절이 벌어진 텍스트 되붙이기("글 로 벌"→"글로벌")
+#          + 구두점 주변 과잉 공백 정리("산 · 학 · 연"→"산·학·연", "( 연 )"→"(연)")
+#          + 심볼폰트 불릿 'l'(▪) 정리("- l 내용"→"- 내용")
+CONVERTER_REV = 5
 
 
 def opts_hash(include_images: bool, include_tables_csv: bool) -> str:
@@ -44,6 +47,11 @@ _BULLET_DEPTH = {"□": 0, "ㅁ": 0, "■": 0,
                  "▪": 2, "-": 2}
 _BULLET_RE = re.compile(rf"^- ([{''.join(_BULLET_DEPTH)}])\s*(.*)$")
 
+# 심볼폰트 불릿(Wingdings 'l'=속 채운 사각 ▪)이 본문 글자 'l'로 추출돼 "- l 내용"으로
+# 나온다(공문서 하위 불릿에 흔함). 반드시 뒤 공백/줄끝을 요구해 실제 'l'로 시작하는
+# 낱말("- long term ...")을 오검하지 않는다. 부모 없는 최상위라 0단계로 둔다.
+_LBULLET_RE = re.compile(r"^- l(?: (.*))?$")
+
 
 def _fix_bullets(md: str) -> str:
     out = []
@@ -54,8 +62,47 @@ def _fix_bullets(md: str) -> str:
             if not text:
                 continue                    # 기호만 있고 내용이 없는 줄 — 본문은 다음 줄에 온다
             line = "  " * _BULLET_DEPTH[m.group(1)] + "- " + text
+        elif (lm := _LBULLET_RE.match(line)):
+            text = (lm.group(1) or "").strip()
+            if not text:
+                continue
+            line = "- " + text
         out.append(line)
     return "\n".join(out)
+
+
+# PDF 자간(letter-spacing)으로 한 음절씩 벌어진 텍스트를 되붙인다. 공문서 조판은 강조
+# 구간에서 어절 사이를 두 칸, 음절 사이를 한 칸으로 벌리므로 두 칸=어절 경계(→한 칸),
+# 한 칸=자간(→제거)로 본다. 음절이 1~2칸 간격으로 4개 이상 이어질 때만 손대므로 정상
+# 국문(어절 사이만 한 칸)은 건드리지 않는다. 어절 경계는 1~3칸(강조 조판은 어절을 세 칸
+# 까지 벌린다)까지 인정 — 다중 공백은 모두 한 칸으로 접힌다. 다음 음절이 여러 칸이라도
+# 정상 어절은 낱 음절이 아니므로 {3,}(4음절 연속) 조건에 걸리지 않아 안전하다.
+# ponytail: 자간 경계까지 한 칸뿐이면 어절이 붙는다. 실무 대부분은 두 칸 이상이라 무시.
+# (?<![가-힣]): 정상 어절 끝 음절("대한민국 과 학..."의 '국')에서 런이 시작돼 앞 단어를
+# 삼키지 않게 한다. 자간 음절은 앞뒤가 공백/비한글로 떨어진 낱 음절이어야 한다.
+_SPACED_RUN = re.compile(r"(?<![가-힣])[가-힣](?: {1,3}[가-힣]){3,}")
+
+
+def _despace(md: str) -> str:
+    def collapse(m):  # 두 칸 → 표식, 한 칸 → 삭제, 표식 → 한 칸
+        return m.group(0).replace("  ", "\x00").replace(" ", "").replace("\x00", " ")
+    return _SPACED_RUN.sub(collapse, md)
+
+
+# 구두점 주변 과잉 공백 정리(자간과 별개 아티팩트): 가운뎃점("산 · 학 · 연"), 괄호·낫표
+# 안쪽 패딩("( 연 )", "｢ 법 ｣"), 연도 약물음표("' 24"→"'24")를 붙인다. 공백만 다루고
+# 줄바꿈은 건드리지 않는다. straight quote(' ")의 열림/닫힘은 판별이 모호해 제외한다.
+_MIDDOT = re.compile(r" *([·‧⸱・･]) *")   # ･=U+FF65 반각(공문서에서 흔함)
+_OPEN = re.compile(r"([｢「『（(\[]) +")
+_CLOSE = re.compile(r" +([｣」』）)\]])")
+_YEAR = re.compile(r"' +(\d)")
+
+
+def _tighten(md: str) -> str:
+    md = _MIDDOT.sub(r"\1", md)
+    md = _OPEN.sub(r"\1", md)
+    md = _CLOSE.sub(r"\1", md)
+    return _YEAR.sub(r"'\1", md)
 
 
 def _build_converter():
@@ -117,7 +164,7 @@ def convert(pdf_path, out_dir, *, include_images: bool, include_tables_csv: bool
     doc.save_as_markdown(str(md_path), artifacts_dir=Path("images"), image_mode=image_mode)
     # docling이 본문을 HTML 이스케이프한 채 마크다운에 내보낸다("R&amp;D"). 되돌린다.
     md = html.unescape(md_path.read_text(encoding="utf-8"))
-    md_path.write_text(_fix_bullets(md), encoding="utf-8")
+    md_path.write_text(_tighten(_despace(_fix_bullets(md))), encoding="utf-8")
 
     n_tables = len(getattr(doc, "tables", None) or [])
     tables_dir = out_dir / "tables"
