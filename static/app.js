@@ -126,8 +126,13 @@ function render() {
   const myDone = jobs.filter((j) => j.status === "done").length;
   downallEl.classList.toggle("hide", myDone < 2);
 
+  // Move a card only when it's actually out of place. Admin mode polls every 2s
+  // and re-renders unconditionally; appendChild-ing all ~200 nodes each tick
+  // re-laid-out the whole queue even when nothing reordered — the flicker on long
+  // lists. Walking a cursor means zero DOM moves in the steady state (no reorder).
   const seen = new Set();
   let created = 0;
+  let cursor = queueEl.firstChild;
   jobs.forEach((j) => {
     seen.add(j.id);
     let el = cards.get(j.id);
@@ -138,7 +143,11 @@ function render() {
     } else {
       patchCard(el, j);
     }
-    queueEl.appendChild(el); // move into sorted order; a move doesn't restart animations
+    if (el === cursor) {
+      cursor = cursor.nextSibling; // already in sorted position; leave it untouched
+    } else {
+      queueEl.insertBefore(el, cursor); // insert new / move out-of-order card into place
+    }
   });
 
   cards.forEach((el, id) => {
