@@ -15,10 +15,27 @@ def is_pdf(head: bytes) -> bool:
     return head[:5] == b"%PDF-"
 
 
-def page_count(path) -> int:
+# 텍스트 레이어 표본 페이지 수. 앞뒤 표지·간지는 원래 비어 있으므로 문서 전체에
+# 고르게 흩어 뽑는다. 13페이지 안팎이면 500페이지 문서에서도 수십 ms.
+_TEXT_PROBE_PAGES = 12
+
+
+def probe(path) -> tuple[int, int]:
+    """(페이지 수, 표본 페이지의 텍스트 길이). 빈 PDF·스캔본 판별용.
+
+    do_ocr=False인 이 파이프라인에서 스캔본(이미지) PDF는 예외 없이 '성공'하고
+    텅 빈 doc.md를 돌려준다. 업로드 시점에 걸러야 사용자가 몇 분을 기다린 끝에
+    빈 결과를 받는 일이 없다.
+    """
     doc = pypdfium2.PdfDocument(path)
     try:
-        return len(doc)
+        n = len(doc)
+        if not n:
+            return 0, 0
+        step = max(1, n // _TEXT_PROBE_PAGES)
+        chars = sum(len(doc[i].get_textpage().get_text_bounded().strip())
+                    for i in range(0, n, step))
+        return n, chars
     finally:
         doc.close()
 
@@ -32,7 +49,11 @@ def page_count(path) -> int:
 #   rev 5: PDF 자간(letter-spacing)으로 음절이 벌어진 텍스트 되붙이기("글 로 벌"→"글로벌")
 #          + 구두점 주변 과잉 공백 정리("산 · 학 · 연"→"산·학·연", "( 연 )"→"(연)")
 #          + 심볼폰트 불릿 'l'(▪) 정리("- l 내용"→"- 내용")
-CONVERTER_REV = 5
+#   rev 6: 제목 규칙(번호/제목이 갈린 제목 병합, 번호·기호로 계층 복원) + 불릿 규칙
+#          (◇◆▷▶·soft hyphen·¡Ÿ 기호 추가, 반복 기호, 기호 없는 항목은 자식으로,
+#          각주/비고 줄은 불릿 해제, 잘린 항목 이어붙이기, 목록 깊이 정규화) +
+#          PUA 글리프 제거 + 어절 자간 잔재("체계성  -  부처") 정리
+CONVERTER_REV = 6
 
 
 def opts_hash(include_images: bool, include_tables_csv: bool) -> str:
@@ -42,33 +63,225 @@ def opts_hash(include_images: bool, include_tables_csv: bool) -> str:
 
 # 공문서 불릿 기호 → 목록 깊이. docling은 이 기호를 본문 글자로 남기므로 "- ㅇ 내용"
 # 처럼 불릿이 겹쳐 보인다. 기호를 지우고 그 계층을 들여쓰기로 옮긴다.
-_BULLET_DEPTH = {"□": 0, "ㅁ": 0, "■": 0,
-                 "ㅇ": 1, "○": 1, "◦": 1, "●": 1,
-                 "▪": 2, "-": 2}
-_BULLET_RE = re.compile(rf"^- ([{''.join(_BULLET_DEPTH)}])\s*(.*)$")
+# ①②③·⇨는 순번·지시 정보를 담고 있어 기호를 지우면 뜻이 사라진다 — 목록에서 제외.
+# ­(soft hyphen): 공문서 하위 불릿 '-'가 이 코드포인트로 조판돼 그대로 추출된다.
+# 눈에는 보통 하이픈과 같아 보이지만 마크다운에는 보이지 않는 글자로 남는다.
+# ¡(U+00A1)·Ÿ(U+0178): 심볼폰트 불릿이 라틴 글자로 추출된 것. 한글 공문서에 이 글자가
+# 본문으로 나올 일은 없다(실측: 한 문서에서 각각 228개, 26개).
+_BULLET_DEPTH = {"□": 0, "ㅁ": 0, "■": 0, "◇": 0, "◆": 0,
+                 "ㅇ": 1, "○": 1, "◦": 1, "●": 1, "▷": 1, "▶": 1, "¡": 1, "Ÿ": 1,
+                 "▪": 2, "-": 2, "­": 2}
+# re.escape: 기호 목록에 '-'가 섞여 있어 문자클래스에서 범위로 읽히면 안 된다.
+_BULLET_CLASS = f"[{re.escape(''.join(_BULLET_DEPTH))}]"
+# docling이 이미 들여쓴 줄도 받고, 같은 기호가 두 번 찍힌 조판도 벗긴다(실측 페이지
+# 머리말: "- ▪ ▪   2025년도 …"). 반복은 공백으로 갈렸을 때만 인정해야 "- ㅇ ㅇㅇ은행"의
+# 본문 첫 글자를 기호로 먹지 않는다.
+_BULLET_RE = re.compile(rf"^ *- ({_BULLET_CLASS})(?:(?: +\1)+ +| *)(.*)$")
+# 내용 없이 기호만 남은 줄. docling이 빈 체크박스("- [] ¡")로 내보내는 서식도 포함.
+_BARE_SYMBOL_RE = re.compile(rf"^ *(?:- )?(?:\[.?\] )?{_BULLET_CLASS} *$")
+# 심볼폰트 잔재 중 목록으로 못 바꾸는 것(표 셀 안 등)은 눈에 보이는 불릿으로만 바꾼다.
+_LEFTOVER_SYMBOLS = ("¡", "Ÿ")
+# 사유 영역(PUA) 글리프: 심볼폰트 문자가 매핑 없이 그대로 나온 것. 뜻이 없으니 지운다.
+_PUA_RE = re.compile("[-] *")
 
 # 심볼폰트 불릿(Wingdings 'l'=속 채운 사각 ▪)이 본문 글자 'l'로 추출돼 "- l 내용"으로
 # 나온다(공문서 하위 불릿에 흔함). 반드시 뒤 공백/줄끝을 요구해 실제 'l'로 시작하는
 # 낱말("- long term ...")을 오검하지 않는다. 부모 없는 최상위라 0단계로 둔다.
 _LBULLET_RE = re.compile(r"^- l(?: (.*))?$")
 
+# 순번·지시 기호로 시작하는 항목은 기호가 소실된 하위 항목이 아니라 그 자체로 온전한
+# 형제 항목이다 — 아래 자식 승격 규칙에서 제외한다.
+_ORDINAL_RE = re.compile(r"^[①-⑳→⇒⇨]")
+
+
+# 각주(*, **)·비고(※)로 시작하는 줄은 목록 항목이 아니라 바로 위 내용의 주석이다.
+# docling이 "- ※ …"처럼 불릿으로 승격시키면 본문 항목과 구분이 사라지고, "* …"는
+# 마크다운이 불릿으로 렌더해 각주 표시가 통째로 사라진다. 불릿을 떼고 '*'는
+# 이스케이프해 글자 그대로 남긴다.
+_NOTE_RE = re.compile(r"^(?:- )?(\*{1,2}|※)\s*(?=[^\s*])")
+
+
+def _as_note(line: str):
+    m = _NOTE_RE.match(line)
+    if not m:
+        return None
+    rest = line[m.end():]
+    if "*" in m.group(1) and "*" in rest:
+        return None                         # "**강조** …" 같은 인라인 서식 — 각주가 아니다
+    return m.group(1).replace("*", r"\*") + " " + rest
+
 
 def _fix_bullets(md: str) -> str:
-    out = []
+    out, depth = [], None                   # depth: 직전 기호 항목의 깊이
     for line in md.split("\n"):
         m = _BULLET_RE.match(line)          # 표 행은 '|'로 시작해 매칭되지 않는다
-        if m:
-            text = m.group(2).strip()
+        if (note := _as_note(line)) is not None:
+            # 빈 줄이 없으면 마크다운이 각주를 바로 위 목록 항목의 이어진 문장으로
+            # 삼켜(lazy continuation) 줄바꿈이 사라진다. 각주는 목록을 끊지 않는다.
+            if out and out[-1].strip():
+                out.append("")
+            line = note
+        elif m:
+            text, depth = (m.group(2) or "").strip(), _BULLET_DEPTH[m.group(1)]
             if not text:
-                continue                    # 기호만 있고 내용이 없는 줄 — 본문은 다음 줄에 온다
-            line = "  " * _BULLET_DEPTH[m.group(1)] + "- " + text
+                depth -= 1                  # 본문은 다음 줄 — 그 줄이 이 기호의 자리를 차지
+                continue
+            line = "  " * depth + "- " + text
+        elif _BARE_SYMBOL_RE.match(line):
+            continue
         elif (lm := _LBULLET_RE.match(line)):
-            text = (lm.group(1) or "").strip()
+            text, depth = (lm.group(1) or "").strip(), 0
             if not text:
+                depth = -1
                 continue
             line = "- " + text
+        elif ((li := _LI_RE.match(line)) and depth is not None
+                and not _ORDINAL_RE.match(li.group(2))):
+            # 기호 없는 항목 = 직전 기호 항목의 하위. docling은 원문의 하위 불릿('-')을
+            # 마크다운 불릿으로 흡수해 기호를 지워버리므로, 들여쓰기만 믿으면 부모와
+            # 자식이 뒤집힌다("¡ (위원회 체계)" 밑의 "- R&D 자체평가위원회는 …").
+            line = "  " * (depth + 1) + "- " + li.group(2)
+        elif line.strip():
+            depth = None                    # 목록이 아닌 내용 = 목록 블록의 끝
         out.append(line)
     return "\n".join(out)
+
+
+# 공문서는 제목 번호를 본문과 다른 텍스트 상자에 찍는다. docling은 그걸 별개 블록으로
+# 읽어 "## 2"와 "## 평가방향"을 두 개의 제목으로 내보낸다. 번호만 있는 제목은 뒤따르는
+# 제목에 합친다.
+_HEAD_RE = re.compile(r"^(#{1,6}) +(\S.*?)\s*$")
+_NUM_ONLY = re.compile(r"^(?:[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+|\d+(?:[-–.]\d+)*\.?|[가-힣][.)])$")
+
+
+def _merge_split_headings(lines: list[str]) -> list[str]:
+    out, i = [], 0
+    while i < len(lines):
+        m = _HEAD_RE.match(lines[i])
+        if m and _NUM_ONLY.match(m.group(2)):
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1                      # 번호와 제목 사이 빈 줄 건너뛰기
+            nxt = _HEAD_RE.match(lines[j]) if j < len(lines) else None
+            if nxt and not _NUM_ONLY.match(nxt.group(2)):
+                out.append(f"{m.group(1)} {m.group(2)} {nxt.group(2)}")
+                i = j + 1
+                continue
+        out.append(lines[i])
+        i += 1
+    return out
+
+
+# docling은 PDF의 시각적 줄바꿈을 그대로 항목 경계로 삼아, 한 문장을 두 개의 불릿으로
+# 쪼갠다("… 사업전략 수정," / "추진체계 개편 등을 …"). 앞 항목이 쉼표·가운뎃점·접속사·
+# 단독 조사로 끝나면 문장이 안 끝난 것이므로 다음 항목을 이어붙인다. 종결어미로 끝나는
+# 정상 항목은 건드리지 않는다.
+# ponytail: "…한다"·"…부처의" 뒤에서 잘린 줄은 못 잡는다. 끝 음절이 조사와 같은 명사
+# ("성과", "결과", "정의")가 흔해 조사 판별에 형태소 분석이 필요하고, 오검(멀쩡한 두
+# 항목을 붙임)이 놓침보다 훨씬 나쁘다. 어절 단위로 확실한 신호만 쓴다.
+_UNFINISHED = re.compile(
+    r"(?:[,，·･]|적인|하여|되어|(?<![가-힣])(?:및|또는|혹은|그리고|위한|대한|관한|따른|의한|통한"
+    r"|이|가|을|를|의|에|와|과|로|으로))$")
+# 뒷줄의 시작 신호가 앞줄의 끝 신호보다 안전하다 — 한국어 문장은 어미("하여")나
+# 조사·접속사("등", "및")로 시작할 수 없다. 잘린 어절("명문화" / "하여 …")도 잡힌다.
+_CONTINUES = re.compile(r"^(?:하여|하고|하는|한다|되어|되고|되는|된다|(?:등|및|또는)(?=\s|$))")
+_LI_RE = re.compile(r"^( *)- (\S.*)$")
+
+
+def _join_wrapped(lines: list[str]) -> list[str]:
+    """들여쓰기가 달라도 잇는다 — docling은 잘린 뒷줄을 최상위 항목으로 내보내는 일이
+    잦다("  - … 정책관점 혹은" / "- 정책수단에 대한 …"). 자식 항목을 거느린 부모가
+    쉼표·접속사로 끝나는 일은 없으므로 깊이를 조건에 넣을 이유가 없다."""
+    out = []
+    for line in lines:
+        m = _LI_RE.match(line)              # 표 행('|')·제목('#')은 매칭되지 않는다
+        prev = _LI_RE.match(out[-1]) if out else None
+        if (m and prev
+                and (_UNFINISHED.search(prev.group(2)) or _CONTINUES.match(m.group(2)))):
+            out[-1] += " " + m.group(2)
+            continue
+        out.append(line)
+    return out
+
+
+def _normalize_depths(lines: list[str]) -> list[str]:
+    """목록 블록마다 깊이를 0부터 다시 매긴다.
+
+    마크다운에서 부모 없는 4칸 들여쓰기는 목록이 아니라 **코드 블록**이다. docling은
+    PDF의 시각적 여백을 그대로 들여쓰기로 옮겨(제목 바로 밑에 4칸 항목) 본문 한 단락을
+    통째로 코드 블록으로 렌더시킨다. 상대 깊이만 살리고 절대값은 버린다.
+    """
+    out, stack = [], []
+    for line in lines:
+        m = _LI_RE.match(line)
+        if not m:
+            if line.strip():
+                stack = []                  # 목록이 아닌 내용 = 목록 블록의 끝
+            out.append(line)
+            continue
+        indent = len(m.group(1))
+        while stack and indent < stack[-1]:
+            stack.pop()
+        if not stack or indent > stack[-1]:
+            stack.append(indent)
+        out.append("  " * (len(stack) - 1) + "- " + m.group(2))
+    return out
+
+
+# 자간 잔재: 강조 조판에서 어절 사이가 두 칸 이상으로 남은 것을 한 칸으로 접는다.
+# _despace가 두 칸을 어절 경계 표식으로 쓰므로 반드시 그 뒤에 돌린다. 들여쓰기(목록
+# 깊이)는 (?<=\S)로 보존하고, 표 행은 셀 정렬이 깨지지 않게 통째로 건너뛴다.
+_INNER_SPACES = re.compile(r"(?<=\S) {2,}")
+
+
+def _collapse_spaces(lines: list[str]) -> list[str]:
+    return [ln if ln.lstrip().startswith("|") else _INNER_SPACES.sub(" ", ln) for ln in lines]
+
+
+# 공문서 목차 번호 → 제목 깊이. docling은 본문 제목을 전부 같은 레벨(##)로 내보내
+# 문서 계층이 통째로 사라진다. 공문서는 번호 형식이 곧 계층이므로 그것으로 되살린다.
+_HEAD_LEVELS = (
+    (re.compile(r"^[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]"), 1),          # Ⅰ 배경 및 방향
+    (re.compile(r"^\d+ *[-–] *\d+"), 3),           # 1-3. 체계성
+    (re.compile(r"^[가-힣][.)] "), 3),              # 가. 세부항목
+    (re.compile(r"^(?:제 *)?\d+[.장절]?(?: |$)"), 2),  # 1. 평가배경 / 2 평가방향
+)
+# 제목 앞에 붙은 공문서 불릿 기호("■ 특정평가 목적")도 계층 신호다. 목록에서 쓰는
+# 깊이를 그대로 재활용한다(□■◇→h2, ㅇ○▷¡→h3, ▪→h4).
+_HEAD_SYMBOL = re.compile(rf"^({_BULLET_CLASS})\s*(\S.*)$")
+
+
+def _head_level(text: str) -> tuple[int | None, str]:
+    """(계층 신호로 읽은 레벨, 기호를 뗀 제목). 신호가 없으면 (None, 원문)."""
+    if m := _HEAD_SYMBOL.match(text):
+        return _BULLET_DEPTH[m.group(1)] + 2, m.group(2)
+    return next((lv for rx, lv in _HEAD_LEVELS if rx.match(text)), None), text
+
+
+def _relevel_headings(lines: list[str]) -> list[str]:
+    heads = [(i, m) for i, ln in enumerate(lines) if (m := _HEAD_RE.match(ln))]
+    if len({m.group(1) for _, m in heads}) != 1:
+        return lines            # docling이 이미 계층을 구분한 문서 — 그 판단을 존중한다
+    leveled = [(i, *_head_level(m.group(2))) for i, m in heads]
+    if not any(lv for _, lv, _ in leveled):
+        return lines            # 번호도 기호도 없다 — 계층을 지어낼 근거가 없다
+    # 무번호 제목은 직전 신호 제목의 한 단계 아래로 둔다. 고정 레벨을 주면 무번호
+    # 제목이 기호 제목의 부모인 문서("평가체계" > "¡ 절차")에서 계층이 뒤집힌다.
+    # 신호가 아직 없으면(문서 맨 앞) 문서 제목이므로 h1.
+    out, signalled, unnumbered = list(lines), 0, None
+    for n, (i, level, text) in enumerate(leveled):
+        if level is None:
+            # 한 섹션 안에서는 무번호 제목의 레벨을 유지한다. 사이에 더 깊은 기호 제목이
+            # 끼어도 뒤따르는 무번호 제목은 그 자식이 아니라 앞 무번호 제목의 형제다.
+            level = unnumbered or signalled + 1
+            if n:
+                unnumbered = level      # 맨 앞 제목은 문서 제목이라 기준이 될 수 없다
+        else:
+            signalled = level
+            if level <= (unnumbered or 7):
+                unnumbered = None       # 같은 깊이 이상의 신호 제목 = 새 섹션의 시작
+        out[i] = "#" * min(level, 6) + " " + text
+    return out
 
 
 # PDF 자간(letter-spacing)으로 한 음절씩 벌어진 텍스트를 되붙인다. 공문서 조판은 강조
@@ -103,6 +316,20 @@ def _tighten(md: str) -> str:
     md = _OPEN.sub(r"\1", md)
     md = _CLOSE.sub(r"\1", md)
     return _YEAR.sub(r"'\1", md)
+
+
+def postprocess(md: str) -> str:
+    """docling 마크다운 정리. 순서가 규칙의 일부다 — _collapse_spaces는 두 칸을
+    어절 경계로 읽는 _despace 뒤, _relevel_headings는 제목이 다 합쳐진 뒤에 온다."""
+    lines = _normalize_depths(
+        _join_wrapped(_merge_split_headings(_fix_bullets(_PUA_RE.sub("", md)).split("\n"))))
+    md = _tighten(_despace("\n".join(lines)))
+    # 줄머리 심볼 불릿은 위에서 목록이 됐다. 남은 건 표 셀 안처럼 목록으로 못 바꾸는
+    # 자리이므로 눈에 보이는 불릿으로만 바꾼다.
+    for sym in _LEFTOVER_SYMBOLS:
+        md = md.replace(sym, "•")
+    lines = md.split("\n")
+    return "\n".join(_relevel_headings(_collapse_spaces(lines)))
 
 
 def _build_converter():
@@ -164,7 +391,7 @@ def convert(pdf_path, out_dir, *, include_images: bool, include_tables_csv: bool
     doc.save_as_markdown(str(md_path), artifacts_dir=Path("images"), image_mode=image_mode)
     # docling이 본문을 HTML 이스케이프한 채 마크다운에 내보낸다("R&amp;D"). 되돌린다.
     md = html.unescape(md_path.read_text(encoding="utf-8"))
-    md_path.write_text(_tighten(_despace(_fix_bullets(md))), encoding="utf-8")
+    md_path.write_text(postprocess(md), encoding="utf-8")
 
     n_tables = len(getattr(doc, "tables", None) or [])
     tables_dir = out_dir / "tables"

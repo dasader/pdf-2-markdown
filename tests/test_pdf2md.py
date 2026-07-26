@@ -127,8 +127,10 @@ def test_is_pdf_magic_bytes():
     assert not convert.is_pdf(b"PK\x03\x04zip")
 
 
-def test_page_count(_=None):
-    assert convert.page_count(FIX) == 1
+def test_probe(_=None):
+    pages, chars = convert.probe(FIX)
+    assert pages == 1
+    assert chars > config.MIN_TEXT_CHARS   # 텍스트 레이어가 있는 PDF
 
 
 def test_opts_hash_stable_and_distinct():
@@ -152,6 +154,9 @@ def test_fix_bullets():
         "- ㅇ 주요국은 전략기술 분야를 선정",
         "- ㅇ",                                    # 기호만, 본문은 다음 줄
         "- 별지와 같이 상정함",
+        "- ◇ 정합성 분석",                         # ◇ → 0단계
+        "- ▷ 세부 검토",                           # ▷ → 1단계
+        "- ① (기술발굴) 패키지 통합 필요",          # 순번 기호 — 지우면 뜻이 사라진다
         "- → 관련 정책 추진중",                    # 불릿 기호가 아님 — 건드리지 않는다
         "| <1> 반도체 | ▪ 고용량 메모리 |",        # 표 행 — 건드리지 않는다
         "## 제목",
@@ -159,10 +164,183 @@ def test_fix_bullets():
     out = convert._fix_bullets(md).split("\n")
     assert out[0] == "- (배경) 기술패권 경쟁"        # □ → 0단계
     assert out[1] == "  - 주요국은 전략기술 분야를 선정"  # ㅇ → 1단계
-    assert out[2] == "- 별지와 같이 상정함"          # 빈 불릿 줄은 사라짐
-    assert out[3] == "- → 관련 정책 추진중"
-    assert out[4] == "| <1> 반도체 | ▪ 고용량 메모리 |"
-    assert out[5] == "## 제목"
+    # 빈 불릿 줄은 사라지고, 그 본문인 다음 줄이 기호의 자리(ㅇ = 1단계)를 물려받는다.
+    assert out[2] == "  - 별지와 같이 상정함"
+    assert out[3] == "- 정합성 분석"
+    assert out[4] == "  - 세부 검토"
+    assert out[5] == "- ① (기술발굴) 패키지 통합 필요"
+    assert out[6] == "- → 관련 정책 추진중"
+    assert out[7] == "| <1> 반도체 | ▪ 고용량 메모리 |"
+    assert out[8] == "## 제목"
+
+
+def test_fix_bullets_unsymboled_item_becomes_child():
+    # docling이 원문 하위 불릿('-')을 마크다운 불릿으로 흡수해 기호를 지운다.
+    # 들여쓰기만 믿으면 부모(¡)와 자식이 뒤집힌다.
+    md = "\n".join([
+        "## 위원회 구성",
+        "- ¡ (위원회 체계) 위원장 1인을 포함한 5인 이상",
+        "- R&D 자체평가위원회는 총괄위원회와 분과위원회로 구성",
+        "- ¡ (총괄위원회 구성) 산학연 전문가를 포함",
+        "본문 문단",                              # 목록 블록의 끝
+        "- 기호 없이 새로 시작하는 항목",
+    ])
+    assert convert._fix_bullets(md).split("\n") == [
+        "## 위원회 구성",
+        "  - (위원회 체계) 위원장 1인을 포함한 5인 이상",
+        "    - R&D 자체평가위원회는 총괄위원회와 분과위원회로 구성",
+        "  - (총괄위원회 구성) 산학연 전문가를 포함",
+        "본문 문단",
+        "- 기호 없이 새로 시작하는 항목",
+    ]
+
+
+def test_fix_bullets_drops_bare_symbol_lines():
+    # 내용 없이 기호만 남은 줄(체크리스트 서식에서 흔함)
+    assert convert._fix_bullets("본문\n¡\n- 항목") == "본문\n- 항목"
+
+
+def test_fix_bullets_repeated_symbol():
+    # 같은 기호를 두 번 찍는 조판(페이지 머리말)
+    assert convert._fix_bullets("- ▪ ▪   2025년도 자체평가 지침") == "    - 2025년도 자체평가 지침"
+    # 본문이 기호와 같은 글자로 시작하면 그건 반복이 아니다 — 먹지 않는다.
+    assert convert._fix_bullets("- ㅇ ㅇㅇ은행 관련") == "  - ㅇㅇ은행 관련"
+    # 기호 뒤에 공백이 없는 조판도 있다.
+    assert convert._fix_bullets("- ▪사업추진(집행) 유형") == "    - 사업추진(집행) 유형"
+
+
+def test_fix_bullets_soft_hyphen():
+    # 공문서 하위 불릿 '-'가 soft hyphen(U+00AD)으로 조판돼 안 보이는 글자로 남는다.
+    assert convert._fix_bullets("- ­ 최근 수행되는 특정평가") == "    - 최근 수행되는 특정평가"
+
+
+def test_postprocess_symbol_bullet_in_table():
+    # 심볼폰트 불릿이 'Ÿ'·'¡'로 추출된다. 표 셀 안이라 목록으로는 못 바꾸고 기호만 바꾼다.
+    out = convert.postprocess("| 평가이슈 | Ÿ 다부처사업 추진의 적절성 ¡ (과정) 증빙 미제출 |")
+    assert "• 다부처사업 추진의 적절성 • (과정) 증빙 미제출" in out
+    # 줄머리에 오면 기호가 아니라 목록이 된다.
+    assert convert.postprocess("- Ÿ 단일 추진형") == "- 단일 추진형"
+
+
+def test_postprocess_strips_pua_glyphs():
+    # 심볼폰트 글리프가 매핑 없이 사유영역(PUA) 코드포인트로 나온 것 — 뜻이 없다.
+    assert convert.postprocess("##### \uf000 자체평가결과") == "##### 자체평가결과"
+
+
+def test_fix_bullets_notes_are_not_list_items():
+    md = "\n".join([
+        "- ※ 패스트트랙을 계속사업으로 전환",       # 비고 — 불릿 해제
+        "* 주요국 창업기업 생존율(5년) : 33.8%",    # 각주 — 마크다운 불릿으로 렌더되면 안 됨
+        "- ** 韓 유니콘기업 진입 수 : 2개",
+        "- **강조** 가 들어간 정상 항목",           # 인라인 서식 — 각주가 아니다
+    ])
+    out = [ln for ln in convert._fix_bullets(md).split("\n") if ln]
+    assert out[0] == "※ 패스트트랙을 계속사업으로 전환"
+    assert out[1] == r"\* 주요국 창업기업 생존율(5년) : 33.8%"
+    assert out[2] == r"\*\* 韓 유니콘기업 진입 수 : 2개"
+    assert out[3] == "- **강조** 가 들어간 정상 항목"
+    # 각주 앞에는 빈 줄이 붙는다 — 없으면 마크다운이 앞 항목에 이어붙인다.
+    assert convert._fix_bullets("- 본문\n* 각주") == "- 본문\n\n\\* 각주"
+
+
+def test_merge_split_headings():
+    lines = ["## 2", "", "## 평가방향", "## 3 기술사업화 대상 사업", "본문"]
+    assert convert._merge_split_headings(lines) == [
+        "## 2 평가방향", "## 3 기술사업화 대상 사업", "본문"]
+    # 뒤에 제목이 없으면 그대로 둔다(번호가 본문일 수도 있다).
+    assert convert._merge_split_headings(["## 2", "본문"]) == ["## 2", "본문"]
+
+
+def test_join_wrapped_bullets():
+    lines = [
+        "- 기술사업화 실적을 평가하여 예산과정에 환류하고, 사업전략 수정,",
+        "- 추진체계 개편 등을 통해 사업목표를 달성",
+        "- 국가R&D 성과가 특허 등에 그치지 않고, 기술이전 및",
+        "- 기술사업화로 경제적 가치를 창출",
+        "- 정상적으로 끝난 항목임",
+        "- 다음 항목은 이어붙이지 않는다",
+        "  - 들여쓰기가 달라도 미완이면,",   # docling은 잘린 뒷줄을 최상위로 내보낸다
+        "- 이어붙인다",
+    ]
+    assert convert._join_wrapped(lines) == [
+        "- 기술사업화 실적을 평가하여 예산과정에 환류하고, 사업전략 수정, 추진체계 개편 등을 통해 사업목표를 달성",
+        "- 국가R&D 성과가 특허 등에 그치지 않고, 기술이전 및 기술사업화로 경제적 가치를 창출",
+        "- 정상적으로 끝난 항목임",
+        "- 다음 항목은 이어붙이지 않는다",
+        "  - 들여쓰기가 달라도 미완이면, 이어붙인다",
+    ]
+
+
+def test_join_wrapped_bullets_by_continuation_marker():
+    # 뒷줄이 어미·조사로 시작하면 앞줄이 끝나지 않은 것 — 한국어 문장은 그렇게 시작 못 한다.
+    lines = ["- 특정평가의 절차와 체계를 정비하고, 이를 운영지침 등으로 명문화",
+             "- 하여 특정평가에 대한 부처의 이해도 향상",
+             "- 수출 실적, 해외 파트너링, 글로벌 인재채용",
+             "- 등 지표가 국제화 중심으로 설계됨",
+             "- 등록 절차는 별도 항목이다"]     # '등록'은 '등'이 아니다
+    assert convert._join_wrapped(lines) == [
+        "- 특정평가의 절차와 체계를 정비하고, 이를 운영지침 등으로 명문화 하여 특정평가에 대한 부처의 이해도 향상",
+        "- 수출 실적, 해외 파트너링, 글로벌 인재채용 등 지표가 국제화 중심으로 설계됨",
+        "- 등록 절차는 별도 항목이다"]
+
+
+def test_normalize_depths():
+    # 부모 없는 4칸 들여쓰기는 마크다운에서 코드 블록이 된다 — 상대 깊이만 남긴다.
+    lines = ["#### 제목", "    - 첫 항목", "    - 둘째 항목", "        - 하위", "  - 되돌아옴",
+             "본문", "    - 새 블록의 첫 항목"]
+    assert convert._normalize_depths(lines) == [
+        "#### 제목", "- 첫 항목", "- 둘째 항목", "  - 하위", "- 되돌아옴",
+        "본문", "- 새 블록의 첫 항목"]
+
+
+def test_collapse_spaces():
+    lines = [
+        "## 1-3.  체계성  -  부처  간  연계  강화",
+        "  - 들여쓰기는  보존",
+        "| 연번   | 부처명    |",              # 표 행 — 셀 정렬 유지
+    ]
+    assert convert._collapse_spaces(lines) == [
+        "## 1-3. 체계성 - 부처 간 연계 강화",
+        "  - 들여쓰기는 보존",
+        "| 연번   | 부처명    |",
+    ]
+
+
+def test_relevel_headings():
+    lines = ["## Ⅰ 배경 및 방향", "## 1 평가배경 및 필요성", "## 1-3. 체계성",
+             "## 가. 세부항목", "## 부처 간 유사･중복 해소", "본문"]
+    assert convert._relevel_headings(lines) == [
+        "# Ⅰ 배경 및 방향", "## 1 평가배경 및 필요성", "### 1-3. 체계성",
+        "### 가. 세부항목", "#### 부처 간 유사･중복 해소", "본문"]
+
+
+def test_relevel_headings_by_bullet_symbol():
+    # 번호 대신 불릿 기호로 계층을 표시하는 공문서. 기호는 떼고 깊이만 남긴다.
+    lines = ["## R&D사업 특정평가 개선 방향",     # 맨 앞 무번호 제목 = 문서 제목
+             "## ■ 특정평가 목적", "## ㅇ더불어 민주당", "## (실천 01) R&D 투자시스템 혁신"]
+    assert convert._relevel_headings(lines) == [
+        "# R&D사업 특정평가 개선 방향",
+        "## 특정평가 목적", "### 더불어 민주당", "#### (실천 01) R&D 투자시스템 혁신"]
+
+
+def test_relevel_headings_unnumbered_can_be_parent():
+    # 무번호 제목이 기호 제목의 부모인 문서. 무번호를 최하위로 고정하면 계층이 뒤집힌다.
+    lines = ["## Ⅱ. 제도 개요", "## 평가체계", "## ¡ 절차", "## ¡ 대상사업",
+             "## 평가결과 산출"]
+    # 그리고 '평가결과 산출'은 '¡ 절차'의 자식이 아니라 '평가체계'의 형제다.
+    assert convert._relevel_headings(lines) == [
+        "# Ⅱ. 제도 개요", "## 평가체계", "### 절차", "### 대상사업", "## 평가결과 산출"]
+
+
+def test_relevel_headings_respects_existing_hierarchy():
+    lines = ["# 큰제목", "## 1 작은제목"]     # docling이 이미 계층을 구분한 문서
+    assert convert._relevel_headings(lines) == lines
+
+
+def test_relevel_headings_skips_documents_without_signals():
+    # 번호도 기호도 없으면 계층을 지어낼 근거가 없다 — docling 출력을 그대로 둔다.
+    lines = ["## 발표자료 제목", "## 배경", "## 결론"]
+    assert convert._relevel_headings(lines) == lines
 
 
 def test_fix_bullets_symbol_l():
@@ -721,6 +899,16 @@ def test_upload_rejects_too_many_pages(client, monkeypatch):
     job = r.json()[0]
     assert job["status"] == "failed"
     assert "500페이지" in job["error"]
+
+
+def test_upload_rejects_textless_pdf(client, monkeypatch):
+    # 스캔본(이미지) PDF: OCR을 끈 파이프라인에선 예외 없이 빈 doc.md가 나온다.
+    monkeypatch.setattr(config, "MIN_TEXT_CHARS", 10_000)
+    r = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
+                    data={"include_images": "true", "include_tables_csv": "true"})
+    job = r.json()[0]
+    assert job["status"] == "failed"
+    assert "스캔본" in job["error"]
 
 
 def test_upload_rejects_over_queue_cap(client, monkeypatch):
