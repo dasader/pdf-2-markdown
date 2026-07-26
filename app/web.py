@@ -94,6 +94,9 @@ def index(request: Request):
 _TOO_BIG = f"파일이 {config.MAX_BYTES // (1024 * 1024)}MB를 초과합니다"
 _TOO_MANY_PAGES = f"{config.MAX_PAGES}페이지를 초과합니다"
 _TOO_MANY_QUEUED = f"대기 잡이 너무 많습니다(최대 {config.MAX_QUEUED_PER_SESSION})"
+_BROKEN_PDF = "PDF를 열 수 없습니다(손상되었거나 암호로 보호된 파일)"
+_EMPTY_PDF = "페이지가 없는 PDF입니다"
+_NO_TEXT = "텍스트 레이어가 없습니다 — 스캔본(이미지) PDF는 OCR 미지원"
 
 
 def _fail(conn, jid, sid, filename, oh, error, *, sha="-", page_total=None):
@@ -136,13 +139,21 @@ async def create_jobs(request: Request,
             if not pdf_path.exists():
                 pdf_path.write_bytes(data)
             try:
-                pages = convert.page_count(pdf_path)
+                pages, text_chars = convert.probe(pdf_path)
             except Exception:
                 out.append(_fail(conn, jid, sid, uf.filename, oh,
-                                 "PDF를 열 수 없습니다", sha=sha)); continue
+                                 _BROKEN_PDF, sha=sha)); continue
+            if pages == 0:
+                out.append(_fail(conn, jid, sid, uf.filename, oh,
+                                 _EMPTY_PDF, sha=sha)); continue
             if pages > config.MAX_PAGES:
                 out.append(_fail(conn, jid, sid, uf.filename, oh,
                                  _TOO_MANY_PAGES, sha=sha, page_total=pages)); continue
+            # 스캔본은 변환이 예외 없이 '성공'하고 빈 doc.md를 남긴다. 몇 분 기다린 끝에
+            # 빈 결과를 받지 않도록 업로드 시점에 거른다.
+            if text_chars < config.MIN_TEXT_CHARS:
+                out.append(_fail(conn, jid, sid, uf.filename, oh,
+                                 _NO_TEXT, sha=sha, page_total=pages)); continue
 
             cached = db.find_cached(conn, sha, oh)
             if cached:
