@@ -75,11 +75,22 @@ function buildCard(j) {
   return el;
 }
 
+// Write only what actually changed. render() patches EVERY card each tick, and
+// admin mode polls a full snapshot of ~200 jobs — unconditional writes meant
+// ~600 DOM writes every tick. className forces a style recalc and textContent
+// replaces the text node even when the string is identical, so the whole queue
+// repainted on every poll: the flicker. Only the running job changes per tick.
 function patchCard(el, j) {
-  el.className = "job " + j.status;
-  el.querySelector(".state").textContent = stateText(j);
-  const w = j.status === "running" ? (j.progress | 0) : j.status === "done" ? 100 : 0;
-  el.querySelector(".bar i").style.width = w + "%";
+  const cls = "job " + j.status;
+  if (el.className !== cls) el.className = cls;
+
+  const stateEl = el.querySelector(".state");
+  const txt = stateText(j);
+  if (stateEl.textContent !== txt) stateEl.textContent = txt;
+
+  const w = (j.status === "running" ? (j.progress | 0) : j.status === "done" ? 100 : 0) + "%";
+  const bar = el.querySelector(".bar i");
+  if (bar.style.width !== w) bar.style.width = w;
 
   let err = el.querySelector(".err");
   if (j.status === "failed" && j.error) {
@@ -88,7 +99,7 @@ function patchCard(el, j) {
       err.className = "err";
       el.appendChild(err);
     }
-    err.textContent = j.error;
+    if (err.textContent !== j.error) err.textContent = j.error;
   } else if (err) {
     err.remove();
   }
@@ -193,7 +204,12 @@ async function refresh() {
 // ---- live updates: SSE normally, poll while admin (EventSource can't carry X-Admin-Key) ----
 
 function connectSSE() {
-  if (sse) return;
+  // adminKey: onerror only checks it when QUEUEING the reconnect. The server ends
+  // each stream after 5 min to force a reconnect, so a timer can already be armed
+  // when the user types the admin key — it then fired into admin mode and ran an
+  // SSE stream (0.5s ticks, and session-scoped since EventSource can't send the
+  // header) alongside the 2s poll. Re-check here, at fire time.
+  if (sse || adminKey) return;
   sse = new EventSource("/api/events");
   sse.onmessage = (e) => applyDelta(JSON.parse(e.data));
   sse.onerror = () => {
