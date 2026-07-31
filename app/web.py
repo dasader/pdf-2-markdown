@@ -176,6 +176,49 @@ async def create_jobs(request: Request,
     return response
 
 
+@app.post("/api/convert")
+async def convert_sync(request: Request,
+                       file: UploadFile,
+                       include_images: str = Form("false"),
+                       include_tables_csv: str = Form("false"),
+                       timeout: float = Form(300)):
+    """PDF 1개 → 마크다운 본문(text/plain). 외부 에이전트용 한 방 엔드포인트.
+
+    업로드 검증·해시캐시·큐는 create_jobs를 그대로 재사용하고, 여기서는 완료를
+    기다렸다가 doc.md만 돌려준다 — 호출자는 쿠키 세션도 폴링도 구현할 필요가 없다.
+    include_images 기본값이 false인 이유: true면 doc.md에 `images/...` 상대경로가
+    남는데, 본문만 가져가는 호출자에게는 받을 수 없는 깨진 링크다.
+    """
+    resp = await create_jobs(request, files=[file],
+                             include_images=include_images,
+                             include_tables_csv=include_tables_csv)
+    job_id = json.loads(resp.body)[0]["id"]
+    conn = db.connect()
+    try:
+        deadline = time.time() + timeout
+        while True:
+            row = db.get_job(conn, job_id)
+            if row["status"] == "done":
+                md = Path(row["result_dir"]) / "doc.md"
+                return PlainTextResponse(md.read_text(encoding="utf-8"))
+            if row["status"] == "failed":
+                return PlainTextResponse(row["error"] or "변환 실패", status_code=422)
+            # 상태 확인을 먼저 하고 마감을 보므로, 캐시 히트나 업로드 검증 실패는
+            # timeout=0이어도 즉시 제 응답으로 나간다.
+            if time.time() >= deadline:
+                break
+            await asyncio.sleep(0.5)
+    finally:
+        conn.close()
+    # 아직 처리 중 — 커넥션을 더 붙들지 않고 잡 id로 넘긴다. 회수는
+    # GET /api/jobs/{id}/preview (create_jobs가 발급한 sid 쿠키 또는 X-Admin-Key 필요).
+    accepted = JSONResponse({"job_id": job_id, "status": "running"}, status_code=202)
+    cookie = resp.headers.get("set-cookie")
+    if cookie:
+        accepted.headers.append("set-cookie", cookie)
+    return accepted
+
+
 @app.get("/api/jobs")
 def list_jobs(request: Request):
     conn = db.connect()
