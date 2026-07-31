@@ -705,6 +705,53 @@ def test_cache_hit_second_upload_skips(client):
     assert j2["n_images"] == 4
 
 
+def _seed_done(client, **opts):
+    """같은 파일·옵션의 done 잡을 하나 심어 /api/convert가 캐시 히트로 즉시 끝나게 한다."""
+    d = {"include_images": "false", "include_tables_csv": "false", **opts}
+    j = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
+                    data=d).json()[0]
+    res_dir = config.RESULTS_DIR / f"{j['sha256']}-{j['opts_hash']}"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    (res_dir / "doc.md").write_text("# 제목\n\n본문", encoding="utf-8")
+    conn = db.connect()
+    db.finish_job(conn, j["id"], status="done", result_dir=str(res_dir),
+                  n_tables=0, n_images=0)
+    conn.close()
+
+
+def test_convert_returns_markdown_body(client):
+    _seed_done(client)
+    r = client.post("/api/convert",
+                    files={"file": ("a.pdf", _pdf_bytes(), "application/pdf")})
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert r.text == "# 제목\n\n본문"  # 마크다운 본문만, JSON 래핑 없음
+
+
+def test_convert_rejects_non_pdf_with_reason(client):
+    r = client.post("/api/convert",
+                    files={"file": ("x.pdf", b"PK\x03\x04not a pdf", "application/pdf")})
+    assert r.status_code == 422
+    assert "PDF" in r.text
+
+
+def test_convert_202_when_not_finished_in_time(client):
+    # 워커가 없어 queued 그대로 → timeout 안에 못 끝내면 잡 id로 넘겨야 한다
+    r = client.post("/api/convert",
+                    files={"file": ("a.pdf", _pdf_bytes(), "application/pdf")},
+                    data={"timeout": "0"})
+    assert r.status_code == 202
+    assert r.json()["job_id"]
+
+
+def test_convert_needs_no_cookie_jar(client):
+    _seed_done(client)
+    fresh = TestClient(client.app)  # 쿠키 없는 새 클라이언트 = 외부 에이전트
+    r = fresh.post("/api/convert",
+                   files={"file": ("a.pdf", _pdf_bytes(), "application/pdf")})
+    assert r.status_code == 200 and r.text == "# 제목\n\n본문"
+
+
 def test_session_isolation_download_404(client):
     r1 = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
                      data={"include_images": "true", "include_tables_csv": "true"})
