@@ -3,7 +3,7 @@
 PDF를 업로드하면 **Markdown**으로 변환해 내려받는 웹서비스. 표(병합셀·중첩 헤더)가 많은
 정부문서·연구보고서에 맞춰 [Docling](https://github.com/docling-project/docling)으로
 표 구조까지 살려 변환한다. 여러 파일을 한 번에 올리면 큐에 쌓아 순차 처리하고 진행 상황을
-실시간으로 보여준다. GPU 없이, 저사양 서버(워커 3GB)에서 돈다.
+실시간으로 보여준다. GPU 없이, 저사양 서버(워커 5GB)에서 돈다.
 
 ![engine](https://img.shields.io/badge/engine-Docling-blue) ![python](https://img.shields.io/badge/python-3.12-green) ![gpu](https://img.shields.io/badge/GPU-불필요-lightgrey)
 
@@ -54,7 +54,10 @@ docker compose (이미지 1개, 서비스 2개)
 - **Redis·Celery·Postgres·nginx·Node 없음.** 워커 1개라 브로커 불필요, 프론트는 빌드 없는
   정적 파일이라 웹서버도 불필요.
 - 워커는 SQLite를 폴링해 `queued` 잡을 하나씩 처리. 순차 처리 = 요구사항이자 메모리 상한 장치.
-- `web`/`worker`는 동일 이미지, 커맨드만 다름. `mem_limit`: web 2GB, worker 3GB.
+- `web`/`worker`는 동일 이미지, 커맨드만 다름. `mem_limit`: web 2GB, worker 5GB
+  (178p·표 87개 보고서 실측 peak 3.9GB — 3GB면 OOM으로 죽는다). worker는
+  `memswap_limit`을 같은 값으로 묶어 **swap을 쓰지 않는다** — swap으로 밀리면
+  워커 1개짜리 큐가 통째로 느려져, 빨리 실패하고 재시도하는 편이 낫다.
 
 ### 변환 엔진
 

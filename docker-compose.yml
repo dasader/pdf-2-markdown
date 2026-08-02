@@ -22,4 +22,9 @@ services:
     # 3g면 178p 보고서가 OOM으로 죽는다. 한 페이지에 이미지 객체가 수십만 개인
     # 병리적 문서는 6.1GB를 써 5g로도 못 살린다 — worker가 재시도 없이 실패시킨다.
     mem_limit: 5g
+    # memswap_limit 미지정 시 도커가 mem_limit×2(=10g)를 잡는다 — 호스트 swap이
+    # 4GB뿐이라 못 쓰는 천장인 데다, 변환이 swap으로 밀리면 워커 1개짜리 큐가
+    # 통째로 몇 배 느려진다. mem_limit와 같은 값 = swap 금지. 5GB를 넘으면
+    # 느리게 끌지 말고 즉시 OOM → worker가 저사양 모드로 1회 재시도 후 failed 처리.
+    memswap_limit: 5g
     restart: unless-stopped

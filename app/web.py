@@ -346,4 +346,8 @@ async def events(request: Request):
         finally:
             conn.close()
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    # X-Accel-Buffering: nginx는 프록시 응답을 기본으로 버퍼링해서, 0.5초 push가
+    # 뭉쳐 오다가 잡이 끝나야 한꺼번에 도착한다(화면상 "멈춘 것처럼" 보인다).
+    # 프록시 쪽 proxy_buffering off에 의존하지 않도록 앱이 직접 끈다.
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"X-Accel-Buffering": "no"})
