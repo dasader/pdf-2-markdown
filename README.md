@@ -55,7 +55,9 @@ docker compose (이미지 1개, 서비스 2개)
   정적 파일이라 웹서버도 불필요.
 - 워커는 SQLite를 폴링해 `queued` 잡을 하나씩 처리. 순차 처리 = 요구사항이자 메모리 상한 장치.
 - `web`/`worker`는 동일 이미지, 커맨드만 다름. `mem_limit`: web 2GB, worker 5GB
-  (178p·표 87개 보고서 실측 peak 3.9GB — 3GB면 OOM으로 죽는다).
+  (178p·표 87개 보고서 실측 peak 3.9GB — 3GB면 OOM으로 죽는다). worker는
+  `memswap_limit`을 같은 값으로 묶어 **swap을 쓰지 않는다** — swap으로 밀리면
+  워커 1개짜리 큐가 통째로 느려져, 빨리 실패하고 재시도하는 편이 낫다.
 
 ### 변환 엔진
 
