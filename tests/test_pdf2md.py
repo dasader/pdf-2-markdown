@@ -789,6 +789,23 @@ def test_jobs_response_has_busy_and_ahead(client):
     assert mine[0]["ahead"] >= 1
 
 
+def test_events_disables_proxy_buffering(client):
+    # 이 헤더가 빠지면 nginx 뒤에서 SSE가 버퍼링돼 진행률이 실시간으로 안 뜬다.
+    import asyncio
+    from app import web
+
+    class Req:
+        cookies = {"sid": "s"}
+        headers = {}
+
+    async def head():
+        resp = await web.events(Req())
+        await resp.body_iterator.aclose()
+        return resp.headers
+
+    assert asyncio.run(head())["x-accel-buffering"] == "no"
+
+
 def test_events_sends_keepalive_when_nothing_changed(client):
     # SSE는 변경/running이 있을 때만 데이터 프레임을 보내고, 그 외엔 코멘트로 연결만
     # 유지한다(클라이언트가 매 틱 재렌더하지 않게). 첫 프레임은 busy 초기값 전달용.
