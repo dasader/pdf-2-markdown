@@ -1,5 +1,6 @@
 import hashlib
 import html
+import os
 import re
 import zipfile
 from pathlib import Path
@@ -334,6 +335,13 @@ def postprocess(md: str) -> str:
     return "\n".join(_relevel_headings(_collapse_spaces(lines)))
 
 
+def _usable_cpus() -> int:
+    """실제로 쓸 수 있는 코어 수. sched_getaffinity는 리눅스 전용이라 폴백을 둔다."""
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 4
+
+
 def _build_converter():
     # 지연 import: 테스트가 torch 없이 돌게 함.
     from docling.datamodel.backend_options import PdfBackendOptions
@@ -367,6 +375,21 @@ def _build_converter():
     opts.queue_max_size = 2
     opts.layout_batch_size = 1
     opts.table_batch_size = 1
+
+    # 속도: docling 기본 num_threads는 4로 고정인데 torch 자체 기본값은 코어 수다 —
+    # 6코어 호스트에서 docling이 오히려 낮춰 잡고 있었다. 실측(코어 6, 51p, 2회 평균):
+    # 1스레드 139.6s / 2 84.4s / 4 65.6s / 6 57.1s / 8 67.6s — 코어 수에서 최적이고
+    # 넘기면(8) 오버서브스크립션으로 4보다도 느리다. 178p도 190.6s → 178.0s(-6.6%).
+    # 메모리·출력은 무관하다(전 구간 peak 2.1~2.2GB, 마크다운 문자수 동일).
+    # 하드코딩하지 않는 이유: 이 서비스는 집 Proxmox와 Oracle VPS 양쪽에서 도는데
+    # 코어 수가 다르면 고정값이 그대로 오버서브스크립션이 된다.
+    # os.cpu_count()가 아니라 sched_getaffinity인 이유: 컨테이너 안에서 cpu_count()는
+    # LXC의 cpuset을 무시하고 물리 호스트를 본다(실측: 컨테이너에서 16, 실제 가용 6).
+    # 그대로 쓰면 16스레드가 되어 기본값 4보다도 느려진다.
+    # ponytail: docker의 --cpus(cgroup 쿼터)까지는 안 본다 — affinity는 그대로라
+    # 못 잡는다. 지금 compose에 cpus 제한이 없어 문제되지 않는다. 걸게 되면
+    # /sys/fs/cgroup/cpu.max의 쿼터도 함께 봐야 한다.
+    opts.accelerator_options.num_threads = _usable_cpus()
 
     # enforce_same_font=False: 기본값(True)은 폰트가 바뀌는 자리에서 텍스트 셀을 쪼갠다.
     # 공문서는 낫표·괄호를 본문과 다른 폰트로 찍는 일이 흔해, "｢국가전략기술 선정(안)｣을
