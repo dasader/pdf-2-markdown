@@ -53,7 +53,9 @@ def probe(path) -> tuple[int, int]:
 #          (◇◆▷▶·soft hyphen·¡Ÿ 기호 추가, 반복 기호, 기호 없는 항목은 자식으로,
 #          각주/비고 줄은 불릿 해제, 잘린 항목 이어붙이기, 목록 깊이 정규화) +
 #          PUA 글리프 제거 + 어절 자간 잔재("체계성  -  부처") 정리
-CONVERTER_REV = 6
+#   rev 7: docling-parse 7.8.1 — 붙어 나오던 한글 어절이 풀리고 목차 표의 쪽번호가
+#          제 셀로 들어간다. 본문이 달라지므로 7.7.0으로 만든 캐시는 버려야 한다.
+CONVERTER_REV = 7
 
 
 def opts_hash(include_images: bool, include_tables_csv: bool) -> str:
