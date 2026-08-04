@@ -1,4 +1,18 @@
 fastapi
 uvicorn[standard]
 python-multipart
-docling
+
+# docling은 고정한다. 2.118은 레이아웃 모델에 torch.compile을 기본으로 켜는데(
+# layout_options.engine_options.compile_model=True), 이 이미지에는 g++가 없어
+# 컴파일이 페이지마다 실패·폴백해 51p 문서가 5분 안에 끝나지 않는다. g++를 넣어
+# 정상 컴파일시켜도 실측 2.2배 느렸다(69.8s → 156.9s). 2.112~2.118에 PDF 변환
+# 속도·메모리·품질 개선은 없다 — 출력 마크다운이 2.111과 바이트 단위로 같았다.
+# 올릴 때는 compile_model=False를 함께 넣고 실측부터 할 것.
+docling==2.111.0
+# docling-parse는 반대로 최신이 확실히 낫다. 7.7.1의 "word extraction with spaces
+# as blockers" 수정으로 한글 어절이 붙어 나오던 게 풀린다("활용할수있도록평가·인증·
+# 모니터링체계를" → "활용할 수 있도록 평가·인증·모니터링 체계를"). 실측 5개 공문서에서
+# 공백 없이 12음절 넘게 붙은 덩어리 103개 → 6개. 변환 시간·메모리는 동일.
+# docling의 제약은 <8.0.0,>=7.0.0으로 느슨해 이 핀이 없으면 재빌드 시점에 따라
+# 결과가 달라진다.
+docling-parse>=7.8.1
