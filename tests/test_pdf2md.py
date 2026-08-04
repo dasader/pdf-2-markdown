@@ -1,3 +1,4 @@
+import inspect
 import time
 from bisect import bisect_left
 
@@ -393,6 +394,27 @@ def test_build_converter_pipeline_options():
     assert fmt.pipeline_options.do_ocr is False
     # True(기본)면 낫표·괄호가 다른 폰트라는 이유로 본문에서 떨어져 나온다.
     assert fmt.backend_options.enforce_same_font is False
+    # 동시에 떠 있는 페이지 수 제한(178p 문서 peak 3.90GB → 3.30GB). 기본값 100/4로
+    # 돌아가면 5GB 워커의 OOM 여유가 1.7GB에서 1.1GB로 줄어든다.
+    assert fmt.pipeline_options.queue_max_size == 2
+    assert fmt.pipeline_options.layout_batch_size == 1
+    assert fmt.pipeline_options.table_batch_size == 1
+
+
+def test_pipeline_is_not_paginated():
+    """옛 settings.perf.page_batch_size가 죽은 knob이었던 이유를 못박아 둔다.
+
+    그 값은 PaginatedPipeline만 읽는데 실제 쓰이는 파이프라인은 그걸 상속하지 않는다.
+    docling이 다시 PaginatedPipeline 계열로 돌아가면 이 테스트가 깨지고, 그때는
+    queue_max_size 대신 page_batch_size를 봐야 한다는 신호가 된다.
+    """
+    pytest.importorskip("docling")
+    from docling.datamodel.base_models import InputFormat
+    from docling.pipeline.base_pipeline import PaginatedPipeline
+
+    cls = convert._build_converter().format_to_options[InputFormat.PDF].pipeline_cls
+    assert not issubclass(cls, PaginatedPipeline)
+    assert "queue_max_size" in inspect.getsource(cls)
 
 
 def test_convert_packages_zip(tmp_path, monkeypatch):
