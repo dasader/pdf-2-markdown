@@ -1,3 +1,4 @@
+import os
 import inspect
 import time
 from bisect import bisect_left
@@ -399,6 +400,17 @@ def test_build_converter_pipeline_options():
     assert fmt.pipeline_options.queue_max_size == 2
     assert fmt.pipeline_options.layout_batch_size == 1
     assert fmt.pipeline_options.table_batch_size == 1
+    # docling 기본값 4는 6코어 호스트에서 13% 손해였다. 가용 코어 수를 따라가야 한다.
+    assert fmt.pipeline_options.accelerator_options.num_threads == convert._usable_cpus()
+
+
+def test_usable_cpus_respects_cpuset():
+    """컨테이너 안에서 os.cpu_count()는 LXC의 cpuset을 무시하고 물리 호스트를 본다
+    (실측: 컨테이너에서 16, 실제 가용 6). 그 값을 쓰면 스레드를 과다 배정한다."""
+    n = convert._usable_cpus()
+    assert n >= 1
+    if hasattr(os, "sched_getaffinity"):
+        assert n == len(os.sched_getaffinity(0))
 
 
 def test_pipeline_is_not_paginated():
