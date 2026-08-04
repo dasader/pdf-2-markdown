@@ -339,7 +339,6 @@ def _build_converter():
     from docling.datamodel.backend_options import PdfBackendOptions
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
-    from docling.datamodel.settings import settings
     from docling.document_converter import DocumentConverter, PdfFormatOption
 
     # 백엔드는 docling 기본값(DoclingParseDocumentBackend)을 쓴다. 한때 더 가벼운
@@ -347,20 +346,27 @@ def _build_converter():
     # word 단위 분할에 맡겨 한글처럼 글자 bbox가 겹치는 조판에서 어절 끝 음절을 다음
     # 단어에 다시 붙인다("저물고," → "저물고, 고,"). 본문·표·CSV가 모두 오염됐다.
     #
-    # 메모리(3GB 워커): do_ocr=False가 가장 큰 레버(~2GB 절감). page_batch_size=1은
-    # 여러 페이지를 동시에 들지 않게 하지만, 한 페이지가 통째로 무거우면 못 막는다.
-    # ponytail: 이미지 객체가 수십만 개인 병리적 페이지(실측: 27p 문서의 한 페이지에
-    # 609,831개)는 백엔드의 비트맵 파싱만으로 4GB를 써 3GB 안에 못 들어온다. 그런
-    # 문서는 worker가 재시도 없이 실패시킨다(_MAX_ATTEMPTS=1). 살려야 한다면 워커
-    # mem_limit을 7GB 이상으로 올려야 한다 — 실측 peak 6.1GB.
-    settings.perf.page_batch_size = 1
-
     opts = PdfPipelineOptions()
     opts.do_ocr = False                       # 텍스트 PDF → OCR 모델 미로딩(~2GB 절감)
     opts.do_table_structure = True
     opts.table_structure_options.mode = TableFormerMode.ACCURATE
     opts.images_scale = 1.25
     opts.generate_picture_images = True       # docling 기본값이 False — 끄면 그림이 통째로 누락
+
+    # 메모리: do_ocr=False 다음으로 큰 레버가 파이프라인에 동시에 떠 있는 페이지 수다.
+    # 여기 한때 settings.perf.page_batch_size=1이 있었는데, 그건 PaginatedPipeline의
+    # knob이라 StandardPdfPipeline(스테이지+큐 구조)에서는 읽히지도 않는 죽은 줄이었다
+    # — MRO에 PaginatedPipeline이 없다. 실제 상한은 queue_max_size(기본 100)다.
+    # 실측: 178p·표 87개 3.90GB → 3.30GB(-15%), 51p 2.78GB → 2.20GB(-19%).
+    # 속도와 출력은 그대로다(178p 190.6s → 192.0s, 마크다운 문자수·표 개수 동일).
+    # 큐를 키우는 쪽은 의미가 없다 — 400으로 4배 늘려도 67.1s로 기본값과 같고 메모리만
+    # 늘었다. 병목이 CPU 추론이라 버퍼를 넓혀도 더 태울 여유가 없다.
+    # ponytail: 이미지 객체가 수십만 개인 병리적 페이지(실측: 27p 문서의 한 페이지에
+    # 609,831개)는 백엔드의 비트맵 파싱만으로 4GB를 써 이걸로도 못 막는다. 그런 문서는
+    # worker가 재시도 없이 실패시킨다(_MAX_ATTEMPTS=1) — 실측 peak 6.1GB.
+    opts.queue_max_size = 2
+    opts.layout_batch_size = 1
+    opts.table_batch_size = 1
 
     # enforce_same_font=False: 기본값(True)은 폰트가 바뀌는 자리에서 텍스트 셀을 쪼갠다.
     # 공문서는 낫표·괄호를 본문과 다른 폰트로 찍는 일이 흔해, "｢국가전략기술 선정(안)｣을
