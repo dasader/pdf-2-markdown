@@ -342,7 +342,7 @@ def _usable_cpus() -> int:
     return os.cpu_count() or 4
 
 
-def _build_converter():
+def _build_converter(*, picture_images: bool = True):
     # 지연 import: 테스트가 torch 없이 돌게 함.
     from docling.datamodel.backend_options import PdfBackendOptions
     from docling.datamodel.base_models import InputFormat
@@ -359,7 +359,14 @@ def _build_converter():
     opts.do_table_structure = True
     opts.table_structure_options.mode = TableFormerMode.ACCURATE
     opts.images_scale = 1.25
-    opts.generate_picture_images = True       # docling 기본값이 False — 끄면 그림이 통째로 누락
+    # docling 기본값은 False — 켜지 않으면 그림이 통째로 누락된다(rev 3에서 한 번 겪었다).
+    # 다만 include_images=false로 부르는 쪽(= /api/convert의 기본값, 에이전트 경로)은
+    # save_as_markdown을 PLACEHOLDER로 저장해 만든 그림을 그대로 버린다. 만들고 버리는
+    # 일이라 안 만드는 게 맞다. 실측(178p·표 87개): 시간은 그대로 185.4s → 184.7s인데
+    # peak 3.31GB → 1.91GB(-42%)다. 마크다운은 md5까지 동일하고, 그림 개수(21)와
+    # <!-- image --> 개수(21)도 그대로다 — 그림 '검출'은 레이아웃 모델이 하고, 이 옵션은
+    # 검출된 자리를 크롭·인코딩할지만 정한다.
+    opts.generate_picture_images = picture_images
 
     # 메모리: do_ocr=False 다음으로 큰 레버가 파이프라인에 동시에 떠 있는 페이지 수다.
     # 여기 한때 settings.perf.page_batch_size=1이 있었는데, 그건 PaginatedPipeline의
@@ -407,7 +414,7 @@ def convert(pdf_path, out_dir, *, include_images: bool, include_tables_csv: bool
     out_dir.mkdir(parents=True, exist_ok=True)
     md_path = out_dir / "doc.md"
 
-    result = _build_converter().convert(str(pdf_path))
+    result = _build_converter(picture_images=include_images).convert(str(pdf_path))
     doc = result.document
 
     try:

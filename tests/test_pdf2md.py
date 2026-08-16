@@ -404,6 +404,52 @@ def test_build_converter_pipeline_options():
     assert fmt.pipeline_options.accelerator_options.num_threads == convert._usable_cpus()
 
 
+def test_build_converter_skips_picture_crop_when_images_off():
+    """include_images=false면 그림을 만들지 않는다.
+
+    그 경로는 save_as_markdown을 PLACEHOLDER로 저장해 만든 그림을 그대로 버린다.
+    실측(178p): 시간 185.4s → 184.7s로 그대로인데 peak 3.31GB → 1.91GB(-42%).
+    마크다운은 md5까지 동일하다. 이 인자가 지워져 항상 True로 돌아가면 API 호출마다
+    쓰지도 않을 그림 크롭에 1.4GB를 다시 쓰게 된다.
+    """
+    pytest.importorskip("docling")
+    from docling.datamodel.base_models import InputFormat
+
+    off = convert._build_converter(picture_images=False)
+    assert off.format_to_options[InputFormat.PDF].pipeline_options.generate_picture_images is False
+
+
+def test_convert_passes_include_images_to_pipeline(tmp_path, monkeypatch):
+    """convert()가 include_images를 파이프라인까지 넘기는지. 여기가 끊기면 위 테스트가
+    통과해도 실제 호출은 여전히 그림을 만든다."""
+    seen = []
+
+    class FakeDoc:
+        tables = []
+        pictures = []
+
+        def save_as_markdown(self, path, **kw):
+            Path(path).write_text("# x", encoding="utf-8")
+
+    class FakeResult:
+        document = FakeDoc()
+
+    class FakeConverter:
+        def convert(self, _):
+            return FakeResult()
+
+    def fake_build(*, picture_images=True):
+        seen.append(picture_images)
+        return FakeConverter()
+
+    monkeypatch.setattr(convert, "_build_converter", fake_build)
+    convert.convert(FIX, tmp_path / "out",
+                    include_images=False, include_tables_csv=False)
+    convert.convert(FIX, tmp_path / "out2",
+                    include_images=True, include_tables_csv=False)
+    assert seen == [False, True]
+
+
 def test_usable_cpus_respects_cpuset():
     """컨테이너 안에서 os.cpu_count()는 LXC의 cpuset을 무시하고 물리 호스트를 본다
     (실측: 컨테이너에서 16, 실제 가용 6). 그 값을 쓰면 스레드를 과다 배정한다."""
