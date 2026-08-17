@@ -824,6 +824,33 @@ def test_convert_202_when_not_finished_in_time(client):
     assert r.json()["job_id"]
 
 
+def test_convert_202_recovery_via_returned_cookie(client):
+    """202 이후 README가 안내하는 회수 경로가 실제로 도는지: 202가 준 sid 쿠키로
+    /api/jobs에서 상태를 보고 preview로 본문을 받는다. 여기가 끊기면 호출자는 202를
+    영구 실패로 볼 수밖에 없고, 그게 '타임아웃'으로 보고되는 흔한 경로다."""
+    fresh = TestClient(client.app)  # 쿠키 없는 외부 호출자
+    r = fresh.post("/api/convert",
+                   files={"file": ("a.pdf", _pdf_bytes(), "application/pdf")},
+                   data={"timeout": "0"})
+    assert r.status_code == 202
+    job = r.json()["job_id"]
+    assert "sid" in fresh.cookies  # 202도 세션 쿠키를 돌려줘야 회수가 가능하다
+
+    # 워커가 없으니 완료를 손으로 만든다
+    conn = db.connect()
+    row = db.get_job(conn, job)
+    res_dir = config.RESULTS_DIR / f"{row['sha256']}-{row['opts_hash']}"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    (res_dir / "doc.md").write_text("# 회수", encoding="utf-8")
+    db.finish_job(conn, job, status="done", result_dir=str(res_dir),
+                  n_tables=0, n_images=0)
+    conn.close()
+
+    listed = fresh.get("/api/jobs").json()["jobs"]
+    assert next(j for j in listed if j["id"] == job)["status"] == "done"
+    assert fresh.get(f"/api/jobs/{job}/preview").text == "# 회수"
+
+
 def test_convert_needs_no_cookie_jar(client):
     _seed_done(client)
     fresh = TestClient(client.app)  # 쿠키 없는 새 클라이언트 = 외부 에이전트
