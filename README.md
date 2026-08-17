@@ -126,6 +126,57 @@ curl -F file=@doc.pdf http://<host>:8001/api/convert     # → 마크다운 본�
 캐시·큐는 `/api/jobs`와 같은 경로를 타므로 같은 파일 재요청은 캐시로 즉시 반환된다.
 워커가 1개라 **앞선 잡이 있으면 그만큼 대기**한다(1.5초/페이지 추정, 500p면 12분).
 
+#### 응답 3종과 202 회수 (호출자가 반드시 처리할 것)
+
+| 코드 | 의미 | 할 일 |
+|---|---|---|
+| `200` | 완료 | 본문이 마크다운 (`text/plain`) |
+| `422` | 거부·실패 | 본문이 사유. 재시도해도 같은 결과 |
+| `202` | **아직 처리 중** | `{"job_id": ...}` + `sid` 쿠키. 그 쿠키로 폴링해 회수 |
+
+`202`를 실패로 취급하는 것이 "타임아웃"의 가장 흔한 원인이다. 두 번째 원인은
+**클라이언트 소켓 타임아웃이 폼필드 `timeout`보다 짧은 것** — 서버는 최대 `timeout`초
+커넥션을 붙들기 때문에, 소켓 타임아웃을 그보다 길게 잡아야 `202`를 받을 수 있다.
+
+```python
+import time, requests
+
+BASE = "http://<host>:8001"
+
+def pdf_to_md(path: str, *, hold: int = 60, wait: int = 1800) -> str:
+    """PDF 경로 → 마크다운 문자열. hold=서버가 커넥션을 붙들 초, wait=총 대기 상한."""
+    s = requests.Session()               # 202가 돌려주는 sid 쿠키 유지 — 회수에 필요
+    with open(path, "rb") as f:
+        r = s.post(f"{BASE}/api/convert",
+                   files={"file": (path, f, "application/pdf")},
+                   data={"timeout": hold},
+                   timeout=hold + 30)    # 소켓 타임아웃 > hold. 반대면 여기서 죽는다
+    if r.status_code == 200:
+        return r.text
+    if r.status_code == 422:
+        raise RuntimeError(f"변환 거부: {r.text}")
+    r.raise_for_status()
+
+    job = r.json()["job_id"]             # 202 — 큐 대기 또는 변환 중
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        time.sleep(5)
+        row = next((j for j in s.get(f"{BASE}/api/jobs", timeout=30).json()["jobs"]
+                    if j["id"] == job), None)
+        if row and row["status"] == "done":
+            return s.get(f"{BASE}/api/jobs/{job}/preview", timeout=30).text
+        if row and row["status"] == "failed":
+            raise RuntimeError(row.get("error") or "변환 실패")
+    raise TimeoutError(f"{wait}s 초과 (job_id={job})")
+```
+
+`preview`는 `done`이 아니면 `404`라 상태를 먼저 봐야 한다. 잡 목록·`preview` 모두
+같은 세션(`sid` 쿠키)만 보이므로 `requests.Session`을 재사용하거나 `X-Admin-Key`
+헤더를 쓴다(`PDF2MD_ADMIN_KEY`가 설정된 경우에만 유효).
+
+여러 PDF를 넣을 때는 이 함수를 **순차로** 부른다 — 워커가 1개라 동시에 던져도 큐에서
+기다릴 뿐이고, 앞선 잡의 대기시간이 뒤 잡의 소켓 타임아웃을 먼저 터뜨린다.
+
 ## 제약·가드레일
 
 - 업로드 검증: 매직바이트(`%PDF`) → **100MB / 500페이지** 상한 → 0페이지·손상·암호걸림
