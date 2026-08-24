@@ -9,6 +9,11 @@ services:
     environment:
       PDF2MD_ADMIN_KEY: "${PDF2MD_ADMIN_KEY:-}"
       PDF2MD_SEC_PER_PAGE: "${PDF2MD_SEC_PER_PAGE:-1.5}"
+      # 업로드 검증 값이라 web만 읽는다(worker는 이미 통과한 잡만 본다).
+      # 기본값이 config.py와 여기 두 곳에 있다 — 바꿀 땐 같이 바꾼다. ${VAR:-기본값}
+      # 형태여야 .env에 키만 있고 값이 빈 줄도 int() 예외 없이 기본값으로 떨어진다.
+      PDF2MD_MAX_PAGES: "${PDF2MD_MAX_PAGES:-1000}"
+      PDF2MD_MIN_TEXT_CHARS: "${PDF2MD_MIN_TEXT_CHARS:-10}"
     mem_limit: 2g
     restart: unless-stopped
 
