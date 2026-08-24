@@ -7,7 +7,6 @@
 --sweep: queue_max_size / batch_size 조합을 훑는다. 2/1/1(현행)이 시간·메모리 모두
 최적이라는 게 실측 결론이므로, 재확인이 필요할 때만 쓴다.
 """
-import ctypes
 import gc
 import hashlib
 import sys
@@ -31,10 +30,10 @@ def _run(conv, pdf):
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    # worker.py가 잡마다 부르는 것과 같은 호출 — 벤치도 같은 조건이어야 값이 맞는다.
-    trim = ctypes.CDLL("libc.so.6").malloc_trim
-
+    # 워커가 잡마다 부르는 바로 그 호출을 그대로 가져다 쓴다 — 따로 바인딩하면
+    # 워커 쪽이 바뀌었을 때 벤치가 다른 조건을 재게 된다.
     from app import convert
+    from app.worker import _malloc_trim as trim
     pdf = args[0]
     n = int(args[1]) if len(args) > 1 else 3
 

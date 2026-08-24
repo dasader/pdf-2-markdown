@@ -88,7 +88,7 @@ function patchCard(el, j) {
   const txt = stateText(j);
   if (stateEl.textContent !== txt) stateEl.textContent = txt;
 
-  const w = (j.status === "running" ? (j.progress | 0) : j.status === "done" ? 100 : 0) + "%";
+  const w = (j.progress | 0) + "%";   // 서버가 done=100 / 그 외=0으로 이미 정규화해 보낸다
   const bar = el.querySelector(".bar i");
   if (bar.style.width !== w) bar.style.width = w;
 
@@ -216,7 +216,10 @@ function connectSSE() {
   sse.onmessage = (e) => applyDelta(JSON.parse(e.data));
   sse.onerror = () => {
     if (sse) { sse.close(); sse = null; }
-    if (!adminKey) setTimeout(connectSSE, 2000);
+    // 재연결 때 전체 스냅샷을 다시 받는다. 델타는 추가만 하므로, 서버에서 사라진 잡
+    // (24시간 보존 만료, 200행 창 밖으로 밀림)의 카드가 오래 열어둔 탭에 유령으로
+    // 남아 있었다. 서버가 5분마다 스트림을 끊으므로 정리도 그 주기로 돈다.
+    if (!adminKey) setTimeout(() => { refresh().catch(() => {}); connectSSE(); }, 2000);
   };
 }
 function stopSSE() {
@@ -265,13 +268,23 @@ async function upload(files) {
 
 // ---- preview / copy ----
 
+// 미리보기 본문 가져오기. res.ok를 반드시 본다 — 404 본문은 "not found"라는 평문이라
+// 그냥 쓰면 그게 마크다운으로 렌더되고 클립보드에도 그대로 들어간다.
+// ponytail: 접속은 localhost 또는 SSH 터널(=secure context) 전제. http://<서버IP>로
+// 직접 열면 navigator.clipboard가 없어 복사가 실패하고 copyMd가 "복사 실패"를 띄운다.
+async function fetchMd(id) {
+  const res = await apiFetch(`/api/jobs/${id}/preview`);
+  if (!res.ok) throw new Error("preview " + res.status);
+  return res.text();
+}
+
 async function openPreview(id) {
   const j = state.get(id);
   modalFn.textContent = j ? j.filename : "";
   mdEl.textContent = "불러오는 중…";
   modalEl.classList.add("open");
   try {
-    const md = await (await apiFetch(`/api/jobs/${id}/preview`)).text();
+    const md = await fetchMd(id);
     mdEl.innerHTML = marked.parse(md);
     mdEl.querySelectorAll("table").forEach((t) => {
       if (!t.parentElement.classList.contains("tw")) {
@@ -286,16 +299,10 @@ async function openPreview(id) {
   }
 }
 
-// ponytail: 접속은 localhost 또는 SSH 터널(=secure context) 전제. http://<서버IP>로
-// 직접 열면 navigator.clipboard가 없어 복사가 실패하고 copyMd가 "복사 실패"를 띄운다.
-async function copyText(text) {
-  await navigator.clipboard.writeText(text);
-}
-
 async function copyMd(id, btn) {
   try {
-    const md = await (await apiFetch(`/api/jobs/${id}/preview`)).text();
-    await copyText(md);
+    const md = await fetchMd(id);
+    await navigator.clipboard.writeText(md);
     const orig = btn.textContent;
     btn.textContent = "복사됨";
     btn.classList.add("copied");
@@ -304,7 +311,8 @@ async function copyMd(id, btn) {
       btn.classList.remove("copied");
     }, 1400);
   } catch (e) {
-    /* silent — preview fetch failed */
+    btn.textContent = "복사 실패";
+    setTimeout(() => (btn.textContent = "마크다운 복사"), 1400);
   }
 }
 

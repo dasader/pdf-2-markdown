@@ -1,10 +1,12 @@
-import os
+import asyncio
 import inspect
+import json
+import os
 import time
 from bisect import bisect_left
 
 import pytest
-from app import config, db
+from app import config, db, web
 
 
 def _use_tmp_data(monkeypatch, tmp_path):
@@ -23,6 +25,11 @@ def conn(tmp_path, monkeypatch):
     c = db.connect()
     yield c
     c.close()
+
+
+class _Req:
+    cookies = {"sid": "s"}
+    headers = {}
 
 
 def _job(conn, jid, session="s1", sha="abc", opts="o1", status="queued", result_dir=None):
@@ -129,7 +136,7 @@ def test_is_pdf_magic_bytes():
     assert not convert.is_pdf(b"PK\x03\x04zip")
 
 
-def test_probe(_=None):
+def test_probe():
     pages, chars = convert.probe(FIX)
     assert pages == 1
     assert chars > config.MIN_TEXT_CHARS   # 텍스트 레이어가 있는 PDF
@@ -419,30 +426,44 @@ def test_build_converter_skips_picture_crop_when_images_off():
     assert off.format_to_options[InputFormat.PDF].pipeline_options.generate_picture_images is False
 
 
-def test_convert_passes_include_images_to_pipeline(tmp_path, monkeypatch):
-    """convert()가 include_images를 파이프라인까지 넘기는지. 여기가 끊기면 위 테스트가
-    통과해도 실제 호출은 여전히 그림을 만든다."""
-    seen = []
 
+def _fake_docling(monkeypatch, *, tables=(), pictures=(), document=None, seen=None):
+    """docling을 가짜로 갈아끼운다 — 변환 없이 convert()의 배선만 본다.
+
+    document: 진짜 DoclingDocument를 넘기면 그대로 쓴다(save_as_markdown 실동작 검증용).
+    seen: 리스트를 넘기면 _build_converter가 받은 picture_images 값을 기록한다.
+    """
     class FakeDoc:
-        tables = []
-        pictures = []
+        def __init__(self):
+            self.tables = list(tables)
+            self.pictures = list(pictures)
 
         def save_as_markdown(self, path, **kw):
-            Path(path).write_text("# x", encoding="utf-8")
+            Path(path).write_text("# hi\n", encoding="utf-8")
+
+    doc = FakeDoc() if document is None else document
 
     class FakeResult:
-        document = FakeDoc()
+        pass
+    FakeResult.document = doc
 
     class FakeConverter:
         def convert(self, _):
             return FakeResult()
 
     def fake_build(*, picture_images=True):
-        seen.append(picture_images)
+        if seen is not None:
+            seen.append(picture_images)
         return FakeConverter()
 
     monkeypatch.setattr(convert, "_build_converter", fake_build)
+
+
+def test_convert_passes_include_images_to_pipeline(tmp_path, monkeypatch):
+    """convert()가 include_images를 파이프라인까지 넘기는지. 여기가 끊기면 위 테스트가
+    통과해도 실제 호출은 여전히 그림을 만든다."""
+    seen = []
+    _fake_docling(monkeypatch, seen=seen)
     convert.convert(FIX, tmp_path / "out",
                     include_images=False, include_tables_csv=False)
     convert.convert(FIX, tmp_path / "out2",
@@ -477,18 +498,7 @@ def test_pipeline_is_not_paginated():
 
 def test_convert_packages_zip(tmp_path, monkeypatch):
     # docling을 가짜로 대체: doc.md만 쓰고 tables/pictures 없음.
-    class FakeDoc:
-        tables = []
-        pictures = []
-        def save_as_markdown(self, path, artifacts_dir=None, image_mode=None):
-            Path(path).write_text("# hi\n")
-    class FakeResult:
-        document = FakeDoc()
-    class FakeConverter:
-        def __init__(self, *a, **k): pass
-        def convert(self, p): return FakeResult()
-
-    monkeypatch.setattr(convert, "_build_converter", lambda **kw: FakeConverter())
+    _fake_docling(monkeypatch)
     out = tmp_path / "X-O"
     result = convert.convert(FIX, out, include_images=True, include_tables_csv=True)
     assert (out / "doc.md").exists()
@@ -501,18 +511,7 @@ def test_convert_packages_zip(tmp_path, monkeypatch):
 
 def test_convert_counts_n_images_regardless_of_include_images(tmp_path, monkeypatch):
     # n_images는 include_images=False여도 문서의 실제 그림 개수를 반영해야 함(n_tables와 대칭).
-    class FakeDoc:
-        tables = []
-        pictures = [object(), object()]
-        def save_as_markdown(self, path, artifacts_dir=None, image_mode=None):
-            Path(path).write_text("# hi\n")
-    class FakeResult:
-        document = FakeDoc()
-    class FakeConverter:
-        def __init__(self, *a, **k): pass
-        def convert(self, p): return FakeResult()
-
-    monkeypatch.setattr(convert, "_build_converter", lambda **kw: FakeConverter())
+    _fake_docling(monkeypatch, pictures=[object(), object()])
     out = tmp_path / "Z-O"
     n_tables, n_images = convert.convert(
         FIX, out, include_images=False, include_tables_csv=False)
@@ -529,18 +528,7 @@ def test_convert_writes_table_csv_and_counts_n_tables(tmp_path, monkeypatch):
         def export_to_dataframe(self, doc=None):
             return pd.DataFrame({"기술분야": ["반도체", "양자"], "b": [3, 4]})
 
-    class FakeDoc:
-        tables = [FakeTable()]
-        pictures = []
-        def save_as_markdown(self, path, artifacts_dir=None, image_mode=None):
-            Path(path).write_text("# hi\n")
-    class FakeResult:
-        document = FakeDoc()
-    class FakeConverter:
-        def __init__(self, *a, **k): pass
-        def convert(self, p): return FakeResult()
-
-    monkeypatch.setattr(convert, "_build_converter", lambda **kw: FakeConverter())
+    _fake_docling(monkeypatch, tables=[FakeTable()])
     out = tmp_path / "Y-O"
     n_tables, n_images = convert.convert(
         FIX, out, include_images=False, include_tables_csv=True)
@@ -570,13 +558,7 @@ def test_convert_image_refs_are_relative_real_docling_core(tmp_path, monkeypatch
     from docling_core.types.doc.document import ImageRef
     real_doc.add_picture(image=ImageRef.from_pil(img, dpi=72))
 
-    class FakeResult:
-        document = real_doc
-    class FakeConverter:
-        def __init__(self, *a, **k): pass
-        def convert(self, p): return FakeResult()
-
-    monkeypatch.setattr(convert, "_build_converter", lambda **kw: FakeConverter())
+    _fake_docling(monkeypatch, document=real_doc)
     out = tmp_path / "W-O"
     n_tables, n_images = convert.convert(
         FIX, out, include_images=True, include_tables_csv=False)
@@ -670,8 +652,6 @@ def test_process_one_fails_after_max_attempts(conn, monkeypatch):
     row = db.get_job(conn, "j1")
     assert row["status"] == "failed"
     assert "너무 무거워" in row["error"]
-    row = db.get_job(conn, "j1")
-    assert row["status"] == "failed"
     assert "메모리" in row["error"]
 
 
@@ -725,12 +705,19 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "ADMIN_KEY", "secret")
     config.ensure_dirs()
     db.init_db()
-    from app import web
     return TestClient(web.app)
 
 
 def _pdf_bytes():
     return FIX.read_bytes()
+
+
+def _upload(client, name="a.pdf", body=None, **data):
+    """업로드 한 번. 옵션을 안 주면 /api/jobs 기본값(이미지·CSV 모두 off)."""
+    return client.post(
+        "/api/jobs",
+        files={"files": (name, _pdf_bytes() if body is None else body, "application/pdf")},
+        data=data)
 
 
 def test_index_sets_session_cookie(client):
@@ -747,9 +734,7 @@ def test_index_sets_session_cookie(client):
 
 
 def test_upload_creates_queued_job(client):
-    r = client.post("/api/jobs",
-                    files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
-                    data={"include_images": "true", "include_tables_csv": "true"})
+    r = _upload(client, include_images="true", include_tables_csv="true")
     assert r.status_code == 200
     jobs = r.json()
     assert len(jobs) == 1 and jobs[0]["status"] == "queued"
@@ -758,8 +743,7 @@ def test_upload_creates_queued_job(client):
 
 def test_upload_defaults_to_no_images_no_csv(client):
     # 옵션 미지정 = 본문만. UI 체크박스도 기본 해제라 여기가 UI 기본값과 같아야 한다.
-    r = client.post("/api/jobs",
-                    files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")})
+    r = _upload(client)
     assert r.json()[0]["opts_hash"] == convert.opts_hash(False, False)
 
 
@@ -784,7 +768,7 @@ def test_cache_hit_second_upload_skips(client):
     db.finish_job(conn, j1["id"], status="done", result_dir=str(res_dir),
                   n_tables=2, n_images=4)
     conn.close()
-    r2 = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")}, data=d)
+    r2 = _upload(client, **d)
     j2 = r2.json()[0]
     assert j2["status"] == "done"  # 캐시 히트 → 즉시 done
     # 캐시 히트 잡은 원본의 표/이미지 카운트를 복사해야 함
@@ -795,8 +779,7 @@ def test_cache_hit_second_upload_skips(client):
 def _seed_done(client, **opts):
     """같은 파일·옵션의 done 잡을 하나 심어 /api/convert가 캐시 히트로 즉시 끝나게 한다."""
     d = {"include_images": "false", "include_tables_csv": "false", **opts}
-    j = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
-                    data=d).json()[0]
+    j = _upload(client, **d).json()[0]
     res_dir = config.RESULTS_DIR / f"{j['sha256']}-{j['opts_hash']}"
     res_dir.mkdir(parents=True, exist_ok=True)
     (res_dir / "doc.md").write_text("# 제목\n\n본문", encoding="utf-8")
@@ -840,24 +823,21 @@ def test_convert_needs_no_cookie_jar(client):
 
 
 def test_session_isolation_download_404(client):
-    r1 = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
-                     data={"include_images": "true", "include_tables_csv": "true"})
+    r1 = _upload(client, include_images="true", include_tables_csv="true")
     jid = r1.json()[0]["id"]
     other = TestClient(client.app)  # 새 세션
     assert other.get(f"/api/jobs/{jid}/download").status_code == 404
 
 
 def test_admin_key_sees_all(client):
-    client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
-                data={"include_images": "true", "include_tables_csv": "true"})
+    _upload(client, include_images="true", include_tables_csv="true")
     other = TestClient(client.app)
     r = other.get("/api/jobs", headers={"X-Admin-Key": "secret"})
     assert len(r.json()["jobs"]) >= 1
 
 
 def test_jobs_response_has_busy_and_ahead(client):
-    r1 = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
-                     data={"include_images": "true", "include_tables_csv": "true"})
+    r1 = _upload(client, include_images="true", include_tables_csv="true")
     conn = db.connect()
     claimed = db.claim_next_queued(conn)  # 다른 워커가 이미 하나를 실행 중이라고 가정
     assert claimed is not None
@@ -878,33 +858,46 @@ def test_jobs_response_has_busy_and_ahead(client):
 
 def test_events_disables_proxy_buffering(client):
     # 이 헤더가 빠지면 nginx 뒤에서 SSE가 버퍼링돼 진행률이 실시간으로 안 뜬다.
-    import asyncio
-    from app import web
-
-    class Req:
-        cookies = {"sid": "s"}
-        headers = {}
 
     async def head():
-        resp = await web.events(Req())
+        resp = await web.events(_Req())
         await resp.body_iterator.aclose()
         return resp.headers
 
     assert asyncio.run(head())["x-accel-buffering"] == "no"
 
 
-def test_events_sends_keepalive_when_nothing_changed(client):
-    # SSE는 변경/running이 있을 때만 데이터 프레임을 보내고, 그 외엔 코멘트로 연결만
-    # 유지한다(클라이언트가 매 틱 재렌더하지 않게). 첫 프레임은 busy 초기값 전달용.
-    import asyncio
-    from app import web
+def test_events_skips_running_job_when_progress_unchanged(client):
+    # running 잡은 예전에 매 틱(0.5초) 무조건 재전송됐다. 진행률은
+    # page_total*SEC_PER_PAGE/100초마다 1%씩만 바뀌므로(1000p면 15초에 1%) 그 프레임의
+    # 대부분이 같은 값을 다시 그리게 했다 — 지금은 progress가 변할 때만 나간다.
+    conn = db.connect()
+    db.create_job(conn, id="r1", session_id="s", filename="f.pdf", sha256="a",
+                  opts_hash="o", status="queued", page_total=1000)
+    db.claim_next_queued(conn)   # -> running, started_at=now
+    conn.close()
 
-    class Req:
-        cookies = {"sid": "s"}
-        headers = {}
+    async def two_frames():
+        resp = await web.events(_Req())
+        out = []
+        async for chunk in resp.body_iterator:
+            out.append(chunk)
+            if len(out) == 2:
+                break
+        await resp.body_iterator.aclose()
+        return out
+
+    first, second = asyncio.run(two_frames())
+    assert first.startswith("data: ")   # 첫 프레임은 스냅샷
+    assert second.startswith(": ")      # 0.5초 뒤 진행률 그대로 -> 재전송 없음
+
+
+def test_events_sends_keepalive_when_nothing_changed(client):
+    # SSE는 변경이 있을 때만 데이터 프레임을 보내고, 그 외엔 코멘트로 연결만
+    # 유지한다(클라이언트가 매 틱 재렌더하지 않게). 첫 프레임은 busy 초기값 전달용.
 
     async def first_two():
-        resp = await web.events(Req())
+        resp = await web.events(_Req())
         out = []
         async for chunk in resp.body_iterator:
             out.append(chunk)
@@ -921,13 +914,6 @@ def test_events_sends_keepalive_when_nothing_changed(client):
 def test_events_resends_queued_jobs_when_ahead_shrinks(client):
     # 앞선 잡이 끝나면 뒤 queued 잡의 대기 순번이 줄어든다. 그 변화도 전송되어야
     # UI의 "앞에 N개 대기"가 낡은 값으로 굳지 않는다.
-    import asyncio
-    import json
-    from app import web
-
-    class Req:
-        cookies = {"sid": "s"}
-        headers = {}
 
     conn = db.connect()
     for i, t in enumerate([100.0, 200.0, 300.0]):
@@ -937,7 +923,7 @@ def test_events_resends_queued_jobs_when_ahead_shrinks(client):
     conn.commit()
 
     async def two_frames():
-        resp = await web.events(Req())
+        resp = await web.events(_Req())
         it = resp.body_iterator
         first = await it.__anext__()
         db.finish_job(conn, "j0", status="done")  # 맨 앞 잡 완료
@@ -956,13 +942,6 @@ def test_events_resends_queued_jobs_when_ahead_shrinks(client):
 def test_events_does_not_resend_unchanged_done_jobs(client):
     # ahead는 queued에만 의미가 있다. done 잡에도 순번을 매기면 앞의 활성 잡이 끝날
     # 때마다 값이 흔들려, 변한 게 없는 done 카드가 계속 재전송된다.
-    import asyncio
-    import json
-    from app import web
-
-    class Req:
-        cookies = {"sid": "s"}
-        headers = {}
 
     conn = db.connect()
     db.create_job(conn, id="q1", session_id="s", filename="a.pdf", sha256="a",
@@ -974,7 +953,7 @@ def test_events_does_not_resend_unchanged_done_jobs(client):
     conn.commit()
 
     async def second_frame():
-        resp = await web.events(Req())
+        resp = await web.events(_Req())
         it = resp.body_iterator
         await it.__anext__()                      # 초기 스냅샷
         db.finish_job(conn, "q1", status="done")  # 유일한 활성 잡이 사라짐
@@ -990,8 +969,7 @@ def test_events_does_not_resend_unchanged_done_jobs(client):
 
 
 def test_download_all_zips_done_jobs(client):
-    r1 = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
-                     data={"include_images": "true", "include_tables_csv": "true"})
+    r1 = _upload(client, include_images="true", include_tables_csv="true")
     j1 = r1.json()[0]
     conn = db.connect()
     res_dir = config.RESULTS_DIR / f"{j1['sha256']}-{j1['opts_hash']}"
@@ -1008,6 +986,9 @@ def test_download_all_zips_done_jobs(client):
     assert r.headers["content-type"] == "application/zip"
     zf = zipfile.ZipFile(BytesIO(r.content))
     assert any(n.endswith("doc.md") for n in zf.namelist())
+    # 잡별 result.zip은 이 디렉터리의 나머지를 이미 담고 있다 — 같이 넣으면 모든 결과가
+    # 두 번 들어가 응답이 2배가 된다.
+    assert not any(n.endswith("result.zip") for n in zf.namelist())
 
     fresh = TestClient(client.app)  # 결과 없는 새 세션
     assert fresh.get("/api/download-all").status_code == 404
@@ -1036,18 +1017,15 @@ def test_download_all_rejects_dotdot_filename(client):
 
 def test_upload_rejects_oversize(client, monkeypatch):
     monkeypatch.setattr(config, "MAX_BYTES", 3)
-    r = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
-                    data={"include_images": "true", "include_tables_csv": "true"})
+    r = _upload(client, include_images="true", include_tables_csv="true")
     job = r.json()[0]
     assert job["status"] == "failed"
-    assert "100MB" in job["error"]
+    assert job["error"] == web._TOO_BIG
 
 
 def test_upload_rejects_too_many_pages(client, monkeypatch):
-    from app import web
     monkeypatch.setattr(config, "MAX_PAGES", 0)
-    r = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
-                    data={"include_images": "true", "include_tables_csv": "true"})
+    r = _upload(client, include_images="true", include_tables_csv="true")
     job = r.json()[0]
     assert job["status"] == "failed"
     # 문구는 import 시점의 MAX_PAGES로 굳는다(monkeypatch는 판정에만 영향) — 상한을
@@ -1058,8 +1036,7 @@ def test_upload_rejects_too_many_pages(client, monkeypatch):
 def test_upload_rejects_textless_pdf(client, monkeypatch):
     # 스캔본(이미지) PDF: OCR을 끈 파이프라인에선 예외 없이 빈 doc.md가 나온다.
     monkeypatch.setattr(config, "MIN_TEXT_CHARS", 10_000)
-    r = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
-                    data={"include_images": "true", "include_tables_csv": "true"})
+    r = _upload(client, include_images="true", include_tables_csv="true")
     job = r.json()[0]
     assert job["status"] == "failed"
     assert "스캔본" in job["error"]
@@ -1068,9 +1045,9 @@ def test_upload_rejects_textless_pdf(client, monkeypatch):
 def test_upload_rejects_over_queue_cap(client, monkeypatch):
     monkeypatch.setattr(config, "MAX_QUEUED_PER_SESSION", 1)
     d = {"include_images": "true", "include_tables_csv": "true"}
-    r1 = client.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")}, data=d)
+    r1 = _upload(client, **d)
     assert r1.json()[0]["status"] == "queued"
-    r2 = client.post("/api/jobs", files={"files": ("b.pdf", _pdf_bytes(), "application/pdf")}, data=d)
+    r2 = _upload(client, "b.pdf", **d)
     job2 = r2.json()[0]
     assert job2["status"] == "failed"
     assert "대기 잡이 너무 많습니다" in job2["error"]
@@ -1083,7 +1060,6 @@ def test_web_self_initializes_storage_without_worker(tmp_path, monkeypatch):
     _use_tmp_data(monkeypatch, tmp_path)
     assert not (tmp_path / "app.db").exists()
 
-    from app import web
     with TestClient(web.app) as c:  # lifespan 실행 -> ensure_dirs()+init_db()
         assert config.DB_PATH.exists()
         r = c.get("/api/jobs")
