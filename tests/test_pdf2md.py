@@ -840,8 +840,7 @@ def test_jobs_response_has_busy_and_ahead(client):
     conn.close()
 
     other = TestClient(client.app)  # 다른 세션
-    r2 = other.post("/api/jobs", files={"files": ("a.pdf", _pdf_bytes(), "application/pdf")},
-                    data={"include_images": "true", "include_tables_csv": "true"})
+    r2 = _upload(other, include_images="true", include_tables_csv="true")
     jid2 = r2.json()[0]["id"]
 
     r = other.get("/api/jobs")
