@@ -1,3 +1,4 @@
+import ctypes
 import shutil
 import time
 import traceback
@@ -10,6 +11,17 @@ _SWEEP_EVERY = 300  # 초
 # 두던 자리인데, 실측상 메모리를 전혀 못 줄여(6.1GB → 6.2GB) 워커만 한 번 더 죽었다.
 # 메모리 폭발의 주범은 그림 크롭이 아니라 백엔드의 페이지 비트맵 파싱이다.
 _MAX_ATTEMPTS = 1
+
+# 잡이 끝나도 torch/docling이 잡았던 임시 텐서가 glibc 아레나에 남아 OS로 반환되지
+# 않는다. 누수는 아니고(10잡쯤에서 포화) 재사용도 되지만, 그만큼 mem_limit 여유가
+# 깎인 채로 다음 잡을 시작한다 — 44p 문서 첫 잡 peak 1.64GB, 정상상태 2.31GB.
+# 실측(44p 12회 A/B): 잡간 상주 1917MB → 1116MB(-42%), peak 2312MB → 1869MB(-19%),
+# 잡 시간은 28.2s → 27.5s로 차이 없다. 무료로 되찾는 여유다.
+# glibc가 아닌 libc에서는 심볼이 없으므로 워커를 죽이지 않고 조용히 건너뛴다.
+try:
+    _malloc_trim = ctypes.CDLL("libc.so.6").malloc_trim
+except (OSError, AttributeError):  # pragma: no cover - 이 이미지는 debian/glibc 고정
+    _malloc_trim = None
 
 
 def process_one(conn) -> bool:
@@ -69,6 +81,8 @@ def run() -> None:
     last_sweep = 0.0
     while True:
         worked = process_one(conn)
+        if worked and _malloc_trim is not None:
+            _malloc_trim(0)
         now = time.time()
         if now - last_sweep > _SWEEP_EVERY:
             sweep(conn)
