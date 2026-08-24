@@ -9,6 +9,7 @@ import zipfile
 import tempfile
 from bisect import bisect_left
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -97,6 +98,10 @@ _TOO_MANY_QUEUED = f"대기 잡이 너무 많습니다(최대 {config.MAX_QUEUED
 _BROKEN_PDF = "PDF를 열 수 없습니다(손상되었거나 암호로 보호된 파일)"
 _EMPTY_PDF = "페이지가 없는 PDF입니다"
 _NO_TEXT = "텍스트 레이어가 없습니다 — 스캔본(이미지) PDF는 OCR 미지원"
+_NOT_PDF = "PDF 파일이 아닙니다"
+# /api/convert가 동기로 기다려주는 상한. MAX_PAGES x SEC_PER_PAGE(=1500초)에
+# 여유를 둔 값 — 넘으면 202 + job_id로 넘겨 커넥션을 놓는다.
+_MAX_SYNC_WAIT = 1800
 
 
 def _fail(conn, jid, sid, filename, oh, error, *, sha="-", page_total=None):
@@ -120,19 +125,20 @@ async def create_jobs(request: Request,
     try:
         for uf in (files or []):
             jid = uuid.uuid4().hex
+            # 가드 8개가 같은 5개 인자를 반복해 넘기며 두 줄로 접히던 자리.
+            fail = partial(_fail, conn, jid, sid, uf.filename, oh)
             # 가드레일: Starlette가 파트의 Content-Length로 채워주는 uf.size를 먼저
             # 확인해 초대형 업로드를 메모리에 통째로 읽기 전에 걸러낸다(OOM 방지).
             # uf.size가 없는(None) 경우에만 아래 read() 이후 len(data) 체크가 백스톱.
             if uf.size is not None and uf.size > config.MAX_BYTES:
-                out.append(_fail(conn, jid, sid, uf.filename, oh, _TOO_BIG)); continue
+                out.append(fail(_TOO_BIG)); continue
             data = await uf.read()
             if len(data) > config.MAX_BYTES:
-                out.append(_fail(conn, jid, sid, uf.filename, oh, _TOO_BIG)); continue
+                out.append(fail(_TOO_BIG)); continue
             if not convert.is_pdf(data[:5]):
-                out.append(_fail(conn, jid, sid, uf.filename, oh,
-                                 "PDF 파일이 아닙니다")); continue
+                out.append(fail(_NOT_PDF)); continue
             if db.count_queued(conn, sid) >= config.MAX_QUEUED_PER_SESSION:
-                out.append(_fail(conn, jid, sid, uf.filename, oh, _TOO_MANY_QUEUED)); continue
+                out.append(fail(_TOO_MANY_QUEUED)); continue
 
             sha = convert.sha256_bytes(data)
             pdf_path = config.UPLOADS_DIR / f"{sha}.pdf"
@@ -141,19 +147,15 @@ async def create_jobs(request: Request,
             try:
                 pages, text_chars = convert.probe(pdf_path)
             except Exception:
-                out.append(_fail(conn, jid, sid, uf.filename, oh,
-                                 _BROKEN_PDF, sha=sha)); continue
+                out.append(fail(_BROKEN_PDF, sha=sha)); continue
             if pages == 0:
-                out.append(_fail(conn, jid, sid, uf.filename, oh,
-                                 _EMPTY_PDF, sha=sha)); continue
+                out.append(fail(_EMPTY_PDF, sha=sha)); continue
             if pages > config.MAX_PAGES:
-                out.append(_fail(conn, jid, sid, uf.filename, oh,
-                                 _TOO_MANY_PAGES, sha=sha, page_total=pages)); continue
+                out.append(fail(_TOO_MANY_PAGES, sha=sha, page_total=pages)); continue
             # 스캔본은 변환이 예외 없이 '성공'하고 빈 doc.md를 남긴다. 몇 분 기다린 끝에
             # 빈 결과를 받지 않도록 업로드 시점에 거른다.
             if text_chars < config.MIN_TEXT_CHARS:
-                out.append(_fail(conn, jid, sid, uf.filename, oh,
-                                 _NO_TEXT, sha=sha, page_total=pages)); continue
+                out.append(fail(_NO_TEXT, sha=sha, page_total=pages)); continue
 
             cached = db.find_cached(conn, sha, oh)
             if cached:
@@ -195,7 +197,7 @@ async def convert_sync(request: Request,
     job_id = json.loads(resp.body)[0]["id"]
     conn = db.connect()
     try:
-        deadline = time.time() + timeout
+        deadline = time.time() + min(timeout, _MAX_SYNC_WAIT)
         while True:
             row = db.get_job(conn, job_id)
             if row["status"] == "done":
@@ -212,7 +214,7 @@ async def convert_sync(request: Request,
         conn.close()
     # 아직 처리 중 — 커넥션을 더 붙들지 않고 잡 id로 넘긴다. 회수는
     # GET /api/jobs/{id}/preview (create_jobs가 발급한 sid 쿠키 또는 X-Admin-Key 필요).
-    accepted = JSONResponse({"job_id": job_id, "status": "running"}, status_code=202)
+    accepted = JSONResponse({"job_id": job_id, "status": row["status"]}, status_code=202)
     cookie = resp.headers.get("set-cookie")
     if cookie:
         accepted.headers.append("set-cookie", cookie)
@@ -265,7 +267,7 @@ def download(request: Request, job_id: str):
     zp = Path(row["result_dir"]) / "result.zip"
     if not zp.exists():
         return PlainTextResponse("not found", status_code=404)
-    name = Path(row["filename"]).stem + ".zip"
+    name = _safe_name(Path(row["filename"]).stem) + ".zip"
     return FileResponse(zp, filename=name, media_type="application/zip")
 
 
@@ -294,7 +296,11 @@ def download_all(request: Request):
                 used[base] = n + 1
                 folder = base if n == 0 else f"{base}-{n}"
                 for f in sorted(src.rglob("*")):
-                    if f.is_file():
+                    # result.zip은 이 디렉터리의 나머지를 이미 담고 있는 잡별 묶음이다.
+                    # 넣으면 모든 결과가 두 번(낱개 + 중첩 zip) 들어가 응답이 2배가 되고,
+                    # 이미 DEFLATE된 것을 다시 압축한다. 브라우저는 이 응답을 blob으로
+                    # 통째로 메모리에 받는다(static/app.js download()).
+                    if f.is_file() and f.name != "result.zip":
                         z.write(f, f"{folder}/{f.relative_to(src)}")
     except Exception:
         os.unlink(tmp_name)
@@ -327,16 +333,19 @@ async def events(request: Request):
                 actives = db.active_created_ats(conn)
                 payload = {}
                 for r in rows:
-                    # ahead를 키에 포함해야, 앞선 잡이 끝나 대기 순번이 줄었을 때 그 뒤
-                    # queued 잡들도 갱신 프레임을 받는다. _serialize와 같이 queued에만
-                    # 계산한다 — done 잡에도 매기면 활성 잡이 빠질 때마다 값이 흔들려
-                    # 변한 게 없는 카드가 계속 재전송된다.
-                    ahead = bisect_left(actives, r["created_at"]) if r["status"] == "queued" else 0
-                    key = (r["status"], r["finished_at"], ahead)
-                    # running 잡은 진행률이 계속 변하므로 변경 여부와 무관하게 항상 포함
-                    if seen.get(r["id"]) != key or r["status"] == "running":
+                    # 키를 직렬화 결과에서 뽑는다 — ahead·progress 규칙이 _serialize에만
+                    # 있어야 둘이 어긋나지 않는다.
+                    # ahead를 키에 넣어야, 앞선 잡이 끝나 대기 순번이 줄었을 때 그 뒤
+                    # queued 잡들도 갱신 프레임을 받는다(_serialize가 queued에만 매기므로
+                    # done 잡의 값이 흔들려 멀쩡한 카드가 재전송되는 일은 없다).
+                    # progress를 키에 넣으면 running 잡을 매 틱 보낼 필요가 없다. 진행률은
+                    # page_total*SEC_PER_PAGE/100초에 1%씩만 바뀌어서(1000p 잡이면 15초),
+                    # 0.5초 틱마다 보내던 프레임의 대부분이 같은 값을 다시 그리게 했다.
+                    d = _serialize(actives, r)
+                    key = (r["status"], r["finished_at"], d.get("ahead", 0), d["progress"])
+                    if seen.get(r["id"]) != key:
                         seen[r["id"]] = key
-                        payload[r["id"]] = _serialize(actives, r)
+                        payload[r["id"]] = d
                 if payload or busy != last_busy:
                     last_busy = busy
                     yield f"data: {json.dumps({'jobs': list(payload.values()), 'busy': busy})}\n\n"

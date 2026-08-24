@@ -40,6 +40,8 @@ docker compose up -d
 | `PDF2MD_ADMIN_KEY` | (빈값) | 관리자 전체조회 키. 비우면 관리자 기능 **비활성** |
 | `PDF2MD_SEC_PER_PAGE` | `1.5` | 진행률 추정용 초/페이지 (실측으로 보정) |
 | `PDF2MD_DATA` | `/data` | 데이터 루트 (compose가 `./data`에 마운트) |
+| `PDF2MD_MAX_PAGES` | `1000` | 업로드 상한 페이지 수 |
+| `PDF2MD_MIN_TEXT_CHARS` | `10` | 표본 텍스트가 이보다 적으면 스캔본으로 보고 거절 |
 
 ## 아키텍처
 
@@ -67,10 +69,18 @@ Docling, CPU 전용. 저사양 호스트에 맞춰 튜닝:
 
 - `do_ocr=False` (텍스트 PDF 전제 → OCR 모델 미로딩, ~2GB 절감)
 - `TableFormerMode.ACCURATE` (표 정확도 우선)
-- **`PyPdfiumDocumentBackend` + `page_batch_size=1`** — 페이지를 1장씩 처리하고 가벼운 PDF
-  백엔드를 써서, 14MB·27페이지 이미지 조밀 문서도 **3GB 안에서 풀 품질로** 변환(실측 검증).
-- OOM 등으로 변환이 실패하면 **저사양 모드(그림 추출 off)로 1회 재시도**, 그래도 실패하면
-  명확한 메시지로 `failed` 처리(무한 재시도·큐 정지 방지).
+- **`queue_max_size=2` + `layout_batch_size=1` + `table_batch_size=1`** — 파이프라인에 동시에
+  떠 있는 페이지 수가 메모리의 가장 큰 레버다(실측: 178p·표 87개 3.90GB → 3.30GB).
+  키우는 쪽은 시간·메모리 모두 손해라 실측으로 확인하고 이 값에 고정했다.
+- **`num_threads = sched_getaffinity`** — docling 기본값 4는 6코어 호스트에서 오히려 낮다
+  (실측 51p: 4스레드 65.6s → 6스레드 57.1s, 8스레드는 67.6s로 역효과). 컨테이너 안에서
+  `os.cpu_count()`는 물리 호스트를 보므로 affinity를 쓴다.
+- 잡이 끝날 때마다 `malloc_trim(0)`으로 glibc 아레나를 반환한다(실측: 잡간 상주 RSS
+  1917MB → 1116MB, 성능 대가 없음).
+- 워커를 한 번 죽인 문서는 **재시도하지 않고** 바로 `failed` 처리한다. 저사양 재시도를 두던
+  자리였는데 실측상 메모리를 못 줄여(6.1GB → 6.2GB) 워커만 한 번 더 죽었다.
+- 백엔드는 docling 기본값을 쓴다. 더 가벼운 `PyPdfiumDocumentBackend`를 썼다가 한글 조판에서
+  어절 끝 음절이 다음 단어에 다시 붙어(본문·표·CSV 오염) 되돌렸다.
 
 #### 공문서 마크다운 후처리 (`convert.postprocess`)
 
@@ -122,7 +132,7 @@ curl -F file=@doc.pdf http://<host>:8001/api/convert     # → 마크다운 본�
 | `file` | (필수) | PDF 1개 |
 | `include_images` | `false` | `true`면 doc.md에 `images/...` 상대경로가 남는다(본문만 받는 쪽엔 깨진 링크) |
 | `include_tables_csv` | `false` | 표는 옵션과 무관하게 본문에 마크다운 표로 들어간다 |
-| `timeout` | `300` | 초. 초과하면 `202 {job_id}` — 회수는 `preview`(쿠키 또는 `X-Admin-Key`) |
+| `timeout` | `300` | 초, 최대 1800. 초과하면 `202 {job_id}` — 회수는 `preview`(쿠키 또는 `X-Admin-Key`) |
 
 검증 실패(비PDF·스캔본·페이지 초과 등)는 `422`에 사유가 그대로 담긴다. 업로드 검증·해시
 캐시·큐는 `/api/jobs`와 같은 경로를 타므로 같은 파일 재요청은 캐시로 즉시 반환된다.
@@ -149,6 +159,16 @@ uv run --with pytest --with fastapi --with python-multipart --with httpx \
 ```
 
 실제 변환은 Docker 안에서 pip 설치된 docling으로 동작한다.
+
+성능·메모리 실측은 `make bench`로 재현한다. worker와 같은 메모리 한도로 컨테이너를 띄우고,
+워커와 똑같이 잡마다 converter를 새로 만들어 **정상상태** 값을 본다(1회차는 모델 로드가
+섞여 있어 운영값이 아니다).
+
+```bash
+make bench PDF=~/문서.pdf          # 3회 반복, 회차별 시간·RSS·peak
+make bench PDF=~/문서.pdf N=12     # 메모리가 어디서 포화하는지
+make bench PDF=~/문서.pdf SWEEP=1  # queue/batch 조합 재확인 (docling 버전을 올렸을 때)
+```
 
 ```
 app/

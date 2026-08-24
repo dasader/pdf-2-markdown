@@ -9,6 +9,11 @@ services:
     environment:
       PDF2MD_ADMIN_KEY: "${PDF2MD_ADMIN_KEY:-}"
       PDF2MD_SEC_PER_PAGE: "${PDF2MD_SEC_PER_PAGE:-1.5}"
+      # 업로드 검증 값이라 web만 읽는다(worker는 이미 통과한 잡만 본다).
+      # 기본값이 config.py와 여기 두 곳에 있다 — 바꿀 땐 같이 바꾼다. ${VAR:-기본값}
+      # 형태여야 .env에 키만 있고 값이 빈 줄도 int() 예외 없이 기본값으로 떨어진다.
+      PDF2MD_MAX_PAGES: "${PDF2MD_MAX_PAGES:-1000}"
+      PDF2MD_MIN_TEXT_CHARS: "${PDF2MD_MIN_TEXT_CHARS:-10}"
     mem_limit: 2g
     restart: unless-stopped
 
@@ -25,6 +30,6 @@ services:
     # memswap_limit 미지정 시 도커가 mem_limit×2(=10g)를 잡는다 — 호스트 swap이
     # 4GB뿐이라 못 쓰는 천장인 데다, 변환이 swap으로 밀리면 워커 1개짜리 큐가
     # 통째로 몇 배 느려진다. mem_limit와 같은 값 = swap 금지. 5GB를 넘으면
-    # 느리게 끌지 말고 즉시 OOM → worker가 저사양 모드로 1회 재시도 후 failed 처리.
+    # 느리게 끌지 말고 즉시 OOM → worker가 재시도 없이 failed 처리(위 주석과 같다).
     memswap_limit: 5g
     restart: unless-stopped
