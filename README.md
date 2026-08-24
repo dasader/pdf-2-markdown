@@ -122,7 +122,7 @@ curl -F file=@doc.pdf http://<host>:8001/api/convert     # → 마크다운 본�
 | `file` | (필수) | PDF 1개 |
 | `include_images` | `false` | `true`면 doc.md에 `images/...` 상대경로가 남는다(본문만 받는 쪽엔 깨진 링크) |
 | `include_tables_csv` | `false` | 표는 옵션과 무관하게 본문에 마크다운 표로 들어간다 |
-| `timeout` | `300` | 초. 초과하면 `202 {job_id}` — 회수는 `preview`(쿠키 또는 `X-Admin-Key`) |
+| `timeout` | `300` | 초, 최대 1800. 초과하면 `202 {job_id}` — 회수는 `preview`(쿠키 또는 `X-Admin-Key`) |
 
 검증 실패(비PDF·스캔본·페이지 초과 등)는 `422`에 사유가 그대로 담긴다. 업로드 검증·해시
 캐시·큐는 `/api/jobs`와 같은 경로를 타므로 같은 파일 재요청은 캐시로 즉시 반환된다.

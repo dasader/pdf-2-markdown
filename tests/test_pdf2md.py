@@ -503,7 +503,6 @@ def test_convert_packages_zip(tmp_path, monkeypatch):
     result = convert.convert(FIX, out, include_images=True, include_tables_csv=True)
     assert (out / "doc.md").exists()
     assert (out / "result.zip").exists()
-    import zipfile
     names = zipfile.ZipFile(out / "result.zip").namelist()
     assert "doc.md" in names
     assert result == (0, 0)
@@ -539,7 +538,6 @@ def test_convert_writes_table_csv_and_counts_n_tables(tmp_path, monkeypatch):
     # BOM이 없으면 Excel이 시스템 인코딩(한국어 Windows는 CP949)으로 읽어 한글이 깨진다.
     assert csv.read_bytes().startswith(b"\xef\xbb\xbf")
     assert "반도체" in csv.read_text(encoding="utf-8-sig")
-    import zipfile
     names = zipfile.ZipFile(out / "result.zip").namelist()
     assert "tables/table-01.csv" in names
 
@@ -748,18 +746,16 @@ def test_upload_defaults_to_no_images_no_csv(client):
 
 
 def test_upload_rejects_non_pdf(client):
-    r = client.post("/api/jobs",
-                    files={"files": ("x.pdf", b"PK\x03\x04not a pdf", "application/pdf")},
-                    data={"include_images": "true", "include_tables_csv": "true"})
+    r = _upload(client, "x.pdf", b"PK\x03\x04not a pdf",
+                include_images="true", include_tables_csv="true")
     jobs = r.json()
     assert jobs[0]["status"] == "failed"
     assert "PDF" in (jobs[0]["error"] or "")
 
 
 def test_cache_hit_second_upload_skips(client):
-    f = {"files": ("a.pdf", _pdf_bytes(), "application/pdf")}
     d = {"include_images": "true", "include_tables_csv": "true"}
-    r1 = client.post("/api/jobs", files=f, data=d)
+    r1 = _upload(client, **d)
     # 첫 잡을 done으로 만들고 결과 디렉토리 생성
     conn = db.connect()
     j1 = r1.json()[0]
@@ -867,6 +863,20 @@ def test_events_disables_proxy_buffering(client):
     assert asyncio.run(head())["x-accel-buffering"] == "no"
 
 
+def _first_two_frames():
+    """SSE 스트림의 앞 두 프레임. 프레임 사이에 DB를 건드려야 하는 테스트는 제 것을 쓴다."""
+    async def run():
+        resp = await web.events(_Req())
+        out = []
+        async for chunk in resp.body_iterator:
+            out.append(chunk)
+            if len(out) == 2:
+                break
+        await resp.body_iterator.aclose()
+        return out
+    return asyncio.run(run())
+
+
 def test_events_skips_running_job_when_progress_unchanged(client):
     # running 잡은 예전에 매 틱(0.5초) 무조건 재전송됐다. 진행률은
     # page_total*SEC_PER_PAGE/100초마다 1%씩만 바뀌므로(1000p면 15초에 1%) 그 프레임의
@@ -877,17 +887,7 @@ def test_events_skips_running_job_when_progress_unchanged(client):
     db.claim_next_queued(conn)   # -> running, started_at=now
     conn.close()
 
-    async def two_frames():
-        resp = await web.events(_Req())
-        out = []
-        async for chunk in resp.body_iterator:
-            out.append(chunk)
-            if len(out) == 2:
-                break
-        await resp.body_iterator.aclose()
-        return out
-
-    first, second = asyncio.run(two_frames())
+    first, second = _first_two_frames()
     assert first.startswith("data: ")   # 첫 프레임은 스냅샷
     assert second.startswith(": ")      # 0.5초 뒤 진행률 그대로 -> 재전송 없음
 
@@ -896,17 +896,7 @@ def test_events_sends_keepalive_when_nothing_changed(client):
     # SSE는 변경이 있을 때만 데이터 프레임을 보내고, 그 외엔 코멘트로 연결만
     # 유지한다(클라이언트가 매 틱 재렌더하지 않게). 첫 프레임은 busy 초기값 전달용.
 
-    async def first_two():
-        resp = await web.events(_Req())
-        out = []
-        async for chunk in resp.body_iterator:
-            out.append(chunk)
-            if len(out) == 2:
-                break
-        await resp.body_iterator.aclose()
-        return out
-
-    first, second = asyncio.run(first_two())
+    first, second = _first_two_frames()
     assert first.startswith("data: ")
     assert second.startswith(": ")
 

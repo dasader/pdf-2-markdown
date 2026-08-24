@@ -219,7 +219,7 @@ function connectSSE() {
     // 재연결 때 전체 스냅샷을 다시 받는다. 델타는 추가만 하므로, 서버에서 사라진 잡
     // (24시간 보존 만료, 200행 창 밖으로 밀림)의 카드가 오래 열어둔 탭에 유령으로
     // 남아 있었다. 서버가 5분마다 스트림을 끊으므로 정리도 그 주기로 돈다.
-    if (!adminKey) setTimeout(() => { refresh().catch(() => {}); connectSSE(); }, 2000);
+    if (!adminKey) setTimeout(() => refresh().catch(() => {}).finally(connectSSE), 2000);
   };
 }
 function stopSSE() {
@@ -300,10 +300,10 @@ async function openPreview(id) {
 }
 
 async function copyMd(id, btn) {
+  const orig = btn.textContent;   // 라벨은 buildCard에만 있다 — 여기서 다시 적지 않는다
   try {
     const md = await fetchMd(id);
     await navigator.clipboard.writeText(md);
-    const orig = btn.textContent;
     btn.textContent = "복사됨";
     btn.classList.add("copied");
     setTimeout(() => {
@@ -312,7 +312,7 @@ async function copyMd(id, btn) {
     }, 1400);
   } catch (e) {
     btn.textContent = "복사 실패";
-    setTimeout(() => (btn.textContent = "마크다운 복사"), 1400);
+    setTimeout(() => (btn.textContent = orig), 1400);
   }
 }
 

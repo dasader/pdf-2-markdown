@@ -17,11 +17,13 @@ _MAX_ATTEMPTS = 1
 # 깎인 채로 다음 잡을 시작한다 — 44p 문서 첫 잡 peak 1.64GB, 정상상태 2.31GB.
 # 실측(44p 12회 A/B): 잡간 상주 1917MB → 1116MB(-42%), peak 2312MB → 1869MB(-19%),
 # 잡 시간은 28.2s → 27.5s로 차이 없다. 무료로 되찾는 여유다.
-# glibc가 아닌 libc에서는 심볼이 없으므로 워커를 죽이지 않고 조용히 건너뛴다.
+# glibc가 아닌 libc에서는 심볼이 없다. 폴백을 no-op으로 두면 호출부(여기와 bench)가
+# 저마다 None을 확인할 필요가 없다 — 한쪽만 빠뜨리면 그쪽이 TypeError로 죽는다.
 try:
     _malloc_trim = ctypes.CDLL("libc.so.6").malloc_trim
 except (OSError, AttributeError):  # pragma: no cover - 이 이미지는 debian/glibc 고정
-    _malloc_trim = None
+    def _malloc_trim(_):
+        return 0
 
 
 def process_one(conn) -> bool:
@@ -81,7 +83,7 @@ def run() -> None:
     last_sweep = 0.0
     while True:
         worked = process_one(conn)
-        if worked and _malloc_trim is not None:
+        if worked:
             _malloc_trim(0)
         now = time.time()
         if now - last_sweep > _SWEEP_EVERY:

@@ -91,13 +91,13 @@ function patchFields(el, j) {
   if (el.className !== cls) el.className = cls;
   const txt = stateText(j);
   if (el.state.textContent !== txt) el.state.textContent = txt;
-  const w = (j.status === "running" ? (j.progress | 0) : j.status === "done" ? 100 : 0) + "%";
+  const w = (j.progress | 0) + "%";   // 서버가 done=100 / 그 외=0으로 정규화해 보낸다
   if (el.bar.style.width !== w) el.bar.style.width = w;
 }
 
 // 5. Steady state: re-patching an unchanged job writes nothing.
 const card = makeCard();
-const job = { status: "done", n_tables: 1, n_images: 0 };
+const job = { status: "done", progress: 100, n_tables: 1, n_images: 0 };
 patchFields(card, job);
 const w0 = card.writes();
 if (w0 === 0) throw new Error("first patch must write the initial values");
