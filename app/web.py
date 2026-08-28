@@ -98,6 +98,7 @@ _TOO_MANY_QUEUED = f"대기 잡이 너무 많습니다(최대 {config.MAX_QUEUED
 _BROKEN_PDF = "PDF를 열 수 없습니다(손상되었거나 암호로 보호된 파일)"
 _EMPTY_PDF = "페이지가 없는 PDF입니다"
 _NO_TEXT = "텍스트 레이어가 없습니다 — 스캔본(이미지) PDF는 OCR 미지원"
+_BROKEN_TEXT = "텍스트 레이어가 깨졌습니다(글자↔코드 매핑 없는 PDF) — OCR 미지원"
 _NOT_PDF = "PDF 파일이 아닙니다"
 # /api/convert가 동기로 기다려주는 상한. MAX_PAGES x SEC_PER_PAGE(=1500초)에
 # 여유를 둔 값 — 넘으면 202 + job_id로 넘겨 커넥션을 놓는다.
@@ -145,7 +146,7 @@ async def create_jobs(request: Request,
             if not pdf_path.exists():
                 pdf_path.write_bytes(data)
             try:
-                pages, text_chars = convert.probe(pdf_path)
+                pages, text_chars, ctrl_ratio = convert.probe(pdf_path)
             except Exception:
                 out.append(fail(_BROKEN_PDF, sha=sha)); continue
             if pages == 0:
@@ -156,6 +157,10 @@ async def create_jobs(request: Request,
             # 빈 결과를 받지 않도록 업로드 시점에 거른다.
             if text_chars < config.MIN_TEXT_CHARS:
                 out.append(fail(_NO_TEXT, sha=sha, page_total=pages)); continue
+            # 텍스트는 있는데 글자로 안 읽히는 PDF. 그냥 두면 몇 분 걸려 쓰레기
+            # 마크다운을 '성공'으로 돌려준다.
+            if ctrl_ratio > convert.MAX_CTRL_RATIO:
+                out.append(fail(_BROKEN_TEXT, sha=sha, page_total=pages)); continue
 
             cached = db.find_cached(conn, sha, oh)
             if cached:

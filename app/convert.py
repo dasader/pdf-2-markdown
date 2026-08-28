@@ -21,22 +21,34 @@ def is_pdf(head: bytes) -> bool:
 _TEXT_PROBE_PAGES = 12
 
 
-def probe(path) -> tuple[int, int]:
-    """(페이지 수, 표본 페이지의 텍스트 길이). 빈 PDF·스캔본 판별용.
+# 텍스트 레이어가 깨진 PDF의 판별선. ToUnicode CMap 없는 Identity-H CID 폰트로
+# 조판된 PDF는 글자가 아니라 글리프 번호가 그대로 추출돼 제어문자 범벅이 된다
+# (실측: 한 정부보고서 221p에서 비공백 문자의 40.1%). 임베드 폰트에 cmap·post
+# 테이블도 없어 어떤 추출기로도 글자를 되살릴 수 없다 — OCR 말고는 방법이 없다.
+# 정상 PDF는 이 비율이 0.0%다(영문 44p·57p, 한글 940p, 픽스처 실측).
+MAX_CTRL_RATIO = 0.05
+
+
+def probe(path) -> tuple[int, int, float]:
+    """(페이지 수, 표본 텍스트 길이, 제어문자 비율). 빈 PDF·스캔본·깨진 텍스트 판별용.
 
     do_ocr=False인 이 파이프라인에서 스캔본(이미지) PDF는 예외 없이 '성공'하고
-    텅 빈 doc.md를 돌려준다. 업로드 시점에 걸러야 사용자가 몇 분을 기다린 끝에
-    빈 결과를 받는 일이 없다.
+    텅 빈 doc.md를 돌려준다. 텍스트 레이어가 깨진 PDF는 한술 더 떠 수백 KB짜리
+    쓰레기 마크다운으로 '성공'한다. 둘 다 업로드 시점에 걸러야 사용자가 몇 분을
+    기다린 끝에 못 쓸 결과를 받는 일이 없다.
     """
     doc = pypdfium2.PdfDocument(path)
     try:
         n = len(doc)
         if not n:
-            return 0, 0
+            return 0, 0, 0.0
         step = max(1, n // _TEXT_PROBE_PAGES)
-        chars = sum(len(doc[i].get_textpage().get_text_bounded().strip())
-                    for i in range(0, n, step))
-        return n, chars
+        # 공백을 모두 턴 뒤 세므로 " " 미만 = \t\n\r이 아닌 진짜 제어문자다.
+        body = "".join("".join(doc[i].get_textpage().get_text_bounded().split())
+                       for i in range(0, n, step))
+        if not body:
+            return n, 0, 0.0
+        return n, len(body), sum(c < " " for c in body) / len(body)
     finally:
         doc.close()
 

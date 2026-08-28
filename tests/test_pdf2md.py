@@ -137,9 +137,10 @@ def test_is_pdf_magic_bytes():
 
 
 def test_probe():
-    pages, chars = convert.probe(FIX)
+    pages, chars, ctrl = convert.probe(FIX)
     assert pages == 1
     assert chars > config.MIN_TEXT_CHARS   # 텍스트 레이어가 있는 PDF
+    assert ctrl <= convert.MAX_CTRL_RATIO  # 글자↔코드 매핑이 온전한 PDF
 
 
 def test_opts_hash_stable_and_distinct():
