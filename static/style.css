@@ -96,6 +96,10 @@ h1 { margin:0; font-size:27px; font-weight:600; letter-spacing:-.02em; text-wrap
   border:none; cursor:pointer; padding:0; border-bottom:1.5px solid transparent; transition:border-color .15s; }
 .downall:hover { border-color:var(--ink); }
 .downall.hide { display:none; }
+/* 삭제는 되돌릴 수 없다. 평소엔 내려받기 버튼들보다 흐리게 둬 오클릭을 줄이고,
+   hover에서만 붉게 켜 무슨 동작인지 분명히 한다. 확인 대화상자가 마지막 관문. */
+.downall.danger { color:var(--ink-muted); }
+.downall.danger:hover { color:var(--fail); border-color:var(--fail); }
 
 /* global heartbeat — shows the shared single worker is alive */
 .beat { display:flex; align-items:center; gap:8px; margin-top:12px; padding:9px 13px;

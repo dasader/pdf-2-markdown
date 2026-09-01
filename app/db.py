@@ -104,6 +104,18 @@ def count_queued(conn, session_id) -> int:
         (session_id,)).fetchone()[0]
 
 
+def delete_done(conn, session_id) -> int:
+    """이 세션의 완료된 잡을 목록에서 지운다(관리자여도 남의 세션은 건드리지 않는다).
+
+    파일은 지우지 않는다 — result_dir은 캐시 히트로 다른 세션의 잡이 같은 경로를
+    물고 있을 수 있다. 워커 sweep이 참조 카운트를 보고 아무도 안 쓰는 것만 치운다.
+    """
+    cur = conn.execute("DELETE FROM jobs WHERE session_id=? AND status='done'",
+                       (session_id,))
+    conn.commit()
+    return cur.rowcount
+
+
 def delete_expired(conn) -> int:
     cur = conn.execute("DELETE FROM jobs WHERE created_at < ?",
                        (time.time() - config.RETENTION_SEC,))

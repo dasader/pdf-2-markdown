@@ -277,7 +277,7 @@ def download(request: Request, job_id: str):
 
 
 @app.get("/api/download-all")
-def download_all(request: Request):
+def download_all(request: Request, md_only: bool = False):
     conn = db.connect()
     try:
         rows = db.list_jobs(conn, _sid(request), admin=_is_admin(request))
@@ -300,6 +300,14 @@ def download_all(request: Request):
                 n = used.get(base, 0)
                 used[base] = n + 1
                 folder = base if n == 0 else f"{base}-{n}"
+                if md_only:
+                    # 본문만 받는 길. 그림·CSV까지 담은 묶음은 수십 MB가 되는데
+                    # 브라우저는 이 응답을 blob으로 통째로 메모리에 받는다.
+                    # 폴더 없이 원본 이름 그대로 평평하게 담아 바로 쓰게 한다.
+                    md = src / "doc.md"
+                    if md.exists():
+                        z.write(md, f"{folder}.md")
+                    continue
                 for f in sorted(src.rglob("*")):
                     # result.zip은 이 디렉터리의 나머지를 이미 담고 있는 잡별 묶음이다.
                     # 넣으면 모든 결과가 두 번(낱개 + 중첩 zip) 들어가 응답이 2배가 되고,
@@ -312,9 +320,24 @@ def download_all(request: Request):
         raise
 
     return FileResponse(
-        tmp_name, filename="pdf2md-변환결과.zip", media_type="application/zip",
-        background=BackgroundTask(os.unlink, tmp_name),
+        tmp_name, filename="pdf2md-마크다운.zip" if md_only else "pdf2md-변환결과.zip",
+        media_type="application/zip", background=BackgroundTask(os.unlink, tmp_name),
     )
+
+
+@app.post("/api/jobs/clear-done")
+def clear_done(request: Request):
+    """완료된 잡을 목록에서 지운다. 삭제 대상은 항상 호출자의 세션뿐 — 관리자 모드는
+    남의 작업까지 보여주므로, 여기서 admin을 인정하면 버튼 하나로 전체 사용자의
+    기록이 날아간다. 그래서 프론트는 관리자 모드에서 이 버튼을 감춘다.
+
+    같은 PDF의 캐시(status='done' 행)도 함께 사라지므로 다시 올리면 처음부터
+    변환한다 — UI 확인 문구가 이 점을 알린다."""
+    conn = db.connect()
+    try:
+        return {"deleted": db.delete_done(conn, _sid(request))}
+    finally:
+        conn.close()
 
 
 @app.get("/api/events")
