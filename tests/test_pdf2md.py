@@ -1005,6 +1005,97 @@ def test_download_all_rejects_dotdot_filename(client):
         assert not Path(n).is_absolute()
 
 
+def test_download_all_md_only_flattens_markdown(client):
+    conn = db.connect()
+    for jid, name in (("m1", "가.pdf"), ("m2", "나.pdf")):
+        res_dir = config.RESULTS_DIR / f"res-{jid}"
+        (res_dir / "images").mkdir(parents=True, exist_ok=True)
+        (res_dir / "doc.md").write_text("# " + name)
+        (res_dir / "images" / "p1.png").write_bytes(b"png")
+        db.create_job(conn, id=jid, session_id="s-md", filename=name, sha256=jid,
+                      opts_hash="O", status="queued", page_total=1)
+        db.finish_job(conn, jid, status="done", result_dir=str(res_dir))
+    conn.close()
+    client.cookies.set("sid", "s-md")
+
+    zf = zipfile.ZipFile(BytesIO(client.get("/api/download-all?md_only=1").content))
+    # 폴더 없이 원본 이름 그대로, 마크다운만.
+    assert sorted(zf.namelist()) == ["가.md", "나.md"]
+    assert zf.read("가.md").decode() == "# 가.pdf"
+
+    # 기본값(md_only 없음)은 그대로 전체를 담는다.
+    full = zipfile.ZipFile(BytesIO(client.get("/api/download-all").content))
+    assert any(n.endswith("images/p1.png") for n in full.namelist())
+
+
+def test_download_all_md_only_dedupes_same_stem(client):
+    # 같은 이름 파일이 둘이면 평평한 zip에서 이름이 겹쳐 하나가 덮인다.
+    conn = db.connect()
+    for jid in ("d1", "d2"):
+        res_dir = config.RESULTS_DIR / f"dup-{jid}"
+        res_dir.mkdir(parents=True, exist_ok=True)
+        (res_dir / "doc.md").write_text(jid)
+        db.create_job(conn, id=jid, session_id="s-dup", filename="같은.pdf", sha256=jid,
+                      opts_hash="O", status="queued", page_total=1)
+        db.finish_job(conn, jid, status="done", result_dir=str(res_dir))
+    conn.close()
+    client.cookies.set("sid", "s-dup")
+
+    zf = zipfile.ZipFile(BytesIO(client.get("/api/download-all?md_only=1").content))
+    assert len(zf.namelist()) == 2
+    assert sorted(zf.namelist()) == ["같은-1.md", "같은.md"]
+
+
+def test_clear_done_removes_only_own_done_jobs(client):
+    conn = db.connect()
+    res_dir = config.RESULTS_DIR / "res-keep"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    (res_dir / "doc.md").write_text("# hi")
+    _job(conn, "c-done", session="s-clear", status="queued")
+    db.finish_job(conn, "c-done", status="done", result_dir=str(res_dir))
+    _job(conn, "c-queued", session="s-clear", status="queued")
+    _job(conn, "c-failed", session="s-clear", status="failed")
+    _job(conn, "other-done", session="s-other", status="queued")
+    db.finish_job(conn, "other-done", status="done", result_dir=str(res_dir))
+    conn.close()
+
+    client.cookies.set("sid", "s-clear")
+    r = client.post("/api/jobs/clear-done")
+    assert r.status_code == 200 and r.json() == {"deleted": 1}
+
+    conn = db.connect()
+    try:
+        assert db.get_job(conn, "c-done") is None
+        # 진행 중·실패 잡과 남의 세션은 그대로.
+        assert db.get_job(conn, "c-queued") is not None
+        assert db.get_job(conn, "c-failed") is not None
+        assert db.get_job(conn, "other-done") is not None
+    finally:
+        conn.close()
+    # 파일은 워커 sweep이 참조 카운트를 보고 치운다 — 여기서 지우면 같은 결과를
+    # 캐시로 물고 있는 other-done이 깨진다.
+    assert (res_dir / "doc.md").exists()
+
+
+def test_clear_done_ignores_admin_key(client):
+    # 관리자 키가 있어도 남의 세션은 지우지 않는다.
+    conn = db.connect()
+    _job(conn, "a-done", session="s-admin", status="queued")
+    db.finish_job(conn, "a-done", status="done", result_dir="/x")
+    _job(conn, "b-done", session="s-victim", status="queued")
+    db.finish_job(conn, "b-done", status="done", result_dir="/x")
+    conn.close()
+
+    client.cookies.set("sid", "s-admin")
+    r = client.post("/api/jobs/clear-done", headers={"X-Admin-Key": "secret"})
+    assert r.json() == {"deleted": 1}
+    conn = db.connect()
+    try:
+        assert db.get_job(conn, "b-done") is not None
+    finally:
+        conn.close()
+
+
 def test_upload_rejects_oversize(client, monkeypatch):
     monkeypatch.setattr(config, "MAX_BYTES", 3)
     r = _upload(client, include_images="true", include_tables_csv="true")

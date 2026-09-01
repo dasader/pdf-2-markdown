@@ -8,6 +8,8 @@ const optCsv = $("#opt-csv");
 const queueEl = $("#queue");
 const beatEl = $("#beat");
 const downallEl = $("#downall");
+const downmdEl = $("#downmd");
+const clearEl = $("#clear");
 const adminBtn = $("#admin");
 const modalEl = $("#modal");
 const modalFn = $("#modal-fn");
@@ -138,6 +140,10 @@ function render() {
 
   const myDone = jobs.filter((j) => j.status === "done").length;
   downallEl.classList.toggle("hide", myDone < 2);
+  downmdEl.classList.toggle("hide", myDone < 2);
+  // 삭제는 1개부터 의미가 있다. 관리자 모드에서는 남의 잡까지 보여 개수가 내 것과
+  // 어긋나므로 감춘다 — 서버도 항상 내 세션만 지운다(web.py clear_done).
+  clearEl.classList.toggle("hide", myDone < 1 || !!adminKey);
 
   // Move a card only when it's actually out of place. Admin mode polls every 2s
   // and re-renders unconditionally; appendChild-ing all ~200 nodes each tick
@@ -332,6 +338,25 @@ addEventListener("keydown", (e) => {
 // ---- download all ----
 
 downallEl.onclick = () => download("/api/download-all", "pdf2md-변환결과.zip");
+downmdEl.onclick = () => download("/api/download-all?md_only=1", "pdf2md-마크다운.zip");
+
+// ---- clear done ----
+
+clearEl.onclick = async () => {
+  const n = [...state.values()].filter((j) => j.status === "done").length;
+  if (!n) return;
+  // 되돌릴 수 없다 — 네이티브 confirm으로 한 번 더 묻는다.
+  if (!confirm(
+    `완료된 변환 ${n}개를 목록에서 지웁니다. 되돌릴 수 없습니다.\n` +
+    `같은 PDF를 다시 올리면 캐시가 사라져 처음부터 변환합니다.\n\n계속할까요?`
+  )) return;
+  const res = await apiFetch("/api/jobs/clear-done", { method: "POST" });
+  if (!res.ok) {
+    alert("삭제에 실패했습니다.");
+    return;
+  }
+  await refresh();
+};
 
 // ---- admin toggle ----
 
