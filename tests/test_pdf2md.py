@@ -410,6 +410,8 @@ def test_build_converter_pipeline_options():
     assert fmt.pipeline_options.table_batch_size == 1
     # docling 기본값 4는 6코어 호스트에서 13% 손해였다. 가용 코어 수를 따라가야 한다.
     assert fmt.pipeline_options.accelerator_options.num_threads == convert._usable_cpus()
+    # PDF 외 백엔드로 새는 길을 막는다(보안 권고가 전부 비PDF 백엔드에 있다).
+    assert conv.allowed_formats == [InputFormat.PDF]
 
 
 def test_build_converter_skips_picture_crop_when_images_off():
