@@ -68,7 +68,10 @@ def probe(path) -> tuple[int, int, float]:
 #          PUA 글리프 제거 + 어절 자간 잔재("체계성  -  부처") 정리
 #   rev 7: docling-parse 7.8.1 — 붙어 나오던 한글 어절이 풀리고 목차 표의 쪽번호가
 #          제 셀로 들어간다. 본문이 달라지므로 7.7.0으로 만든 캐시는 버려야 한다.
-CONVERTER_REV = 7
+#   rev 8: 출력에 영향을 주는 의존성 고정(docling-parse 7.24.2 등, requirements.txt).
+#          그동안 docling-parse가 >=7.8.1로 떠 있어 빌드 시점마다 결과가 달랐다 —
+#          rev 7 캐시가 어느 버전으로 만들어졌는지 알 수 없어 버린다.
+CONVERTER_REV = 8
 
 
 def opts_hash(include_images: bool, include_tables_csv: bool) -> str:
@@ -415,7 +418,11 @@ def _build_converter(*, picture_images: bool = True):
     # 별지와 같이"가 본문과 "｢ ( ) ｣" 두 줄로 갈렸다. 실측: 커버리지 72.0%→78.0%,
     # 60.7%→61.7%, 표 개수·음절 중복 변화 없음.
     backend_options = PdfBackendOptions(enforce_same_font=False)
+    # allowed_formats: 기본값은 docling이 아는 모든 형식이다. 업로드는 %PDF 시그니처로
+    # 거르지만 형식 판별은 docling이 다시 하므로, PDF 외 백엔드(ZIP·LaTeX·HTML 등 보안
+    # 권고가 몰린 곳)로는 아예 못 가게 막는다. 2.111에 미패치 권고 18건이 전부 그쪽이다.
     return DocumentConverter(
+        allowed_formats=[InputFormat.PDF],
         format_options={InputFormat.PDF: PdfFormatOption(
             pipeline_options=opts, backend_options=backend_options)}
     )
